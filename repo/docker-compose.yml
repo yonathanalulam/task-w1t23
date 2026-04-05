@@ -1,25 +1,42 @@
 name: ${COMPOSE_PROJECT_NAME:-rrga_${USER:-local}}
 
 services:
+  runtime-init:
+    image: alpine:3.20
+    command: ["sh", "/bootstrap_runtime_files.sh"]
+    volumes:
+      - runtime_state:/run/rrga-runtime
+      - ./scripts/bootstrap_runtime_files.sh:/bootstrap_runtime_files.sh:ro
+
   db:
     image: postgres:16
+    depends_on:
+      runtime-init:
+        condition: service_completed_successfully
     environment:
-      POSTGRES_USER: ${RRGA_DB_USER:?RRGA_DB_USER must be provided by runtime env or wrapper}
-      POSTGRES_PASSWORD: ${RRGA_DB_PASSWORD:?RRGA_DB_PASSWORD must be provided by runtime env or wrapper}
-      POSTGRES_DB: ${RRGA_DB_NAME:?RRGA_DB_NAME must be provided by runtime env or wrapper}
+      POSTGRES_USER_FILE: /run/rrga-runtime/db_user
+      POSTGRES_PASSWORD_FILE: /run/rrga-runtime/db_password
+      POSTGRES_DB_FILE: /run/rrga-runtime/db_name
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U \"$(cat /run/rrga-runtime/db_user)\" -d postgres"
+        ]
       interval: 5s
       timeout: 5s
       retries: 20
     volumes:
       - pg_data:/var/lib/postgresql/data
+      - runtime_state:/run/rrga-runtime:ro
 
   api:
     build:
       context: .
       dockerfile: Dockerfile
     depends_on:
+      runtime-init:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
     environment:
@@ -27,15 +44,17 @@ services:
       PORT: 3000
       PGHOST: ${RRGA_DB_HOST:-db}
       PGPORT: ${RRGA_DB_PORT:-5432}
-      PGUSER: ${RRGA_DB_USER:?RRGA_DB_USER must be provided by runtime env or wrapper}
-      PGPASSWORD: ${RRGA_DB_PASSWORD:?RRGA_DB_PASSWORD must be provided by runtime env or wrapper}
-      PGDATABASE: ${RRGA_DB_NAME:?RRGA_DB_NAME must be provided by runtime env or wrapper}
+      PGUSER_FILE: /run/rrga-runtime/db_user
+      PGPASSWORD_FILE: /run/rrga-runtime/db_password
+      PGDATABASE_FILE: /run/rrga-runtime/db_name
       LOG_LEVEL: info
-      APP_SESSION_SECRET: ${APP_SESSION_SECRET:?APP_SESSION_SECRET must be provided by runtime env or wrapper}
-      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?APP_ENCRYPTION_KEY must be provided by runtime env or wrapper}
+      APP_SESSION_SECRET_FILE: /run/rrga-runtime/app_session_secret
+      APP_ENCRYPTION_KEY_FILE: /run/rrga-runtime/app_encryption_key
     command: bash -lc "./init_db.sh && npm run dev -w @rrga/api"
     expose:
       - "3000"
+    volumes:
+      - runtime_state:/run/rrga-runtime:ro
 
   web:
     build:
@@ -58,3 +77,4 @@ services:
 
 volumes:
   pg_data:
+  runtime_state:

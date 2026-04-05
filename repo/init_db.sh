@@ -39,7 +39,7 @@ PGDATABASE="$(load_required_from_env_or_file PGDATABASE)"
 export PGPASSWORD
 
 echo "[init_db] Waiting for PostgreSQL at ${PGHOST}:${PGPORT}..."
-until pg_isready -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" >/dev/null 2>&1; do
+until pg_isready -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d postgres >/dev/null 2>&1; do
   sleep 1
 done
 

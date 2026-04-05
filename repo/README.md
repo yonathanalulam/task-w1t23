@@ -133,7 +133,15 @@ Primary runtime contract for this repo is:
 
 This wrapper is Docker-first underneath and is the supported operational path because it keeps runtime credentials/secrets and project naming consistent across later invocations (`ps`, `logs`, `down`, `url`) without `.env` files.
 
-Direct `docker compose up --build` is still available for advanced/manual usage when all required runtime env vars are explicitly supplied, but it is not the primary user-facing contract.
+Cold-start raw Compose is also supported now:
+
+```bash
+docker compose up --build
+```
+
+On first boot, Compose provisions runtime DB/app secret files inside a Docker-managed volume automatically, so a clean clone does not require exported `RRGA_DB_*`, `APP_SESSION_SECRET`, or `APP_ENCRYPTION_KEY` values.
+
+`./run_app.sh up` remains the preferred user-facing command because it also handles stable follow-up commands and fixed-port fallback behavior.
 
 Underlying Docker command used by wrapper:
 
@@ -171,7 +179,8 @@ Operational follow-up commands (consistent across shells):
 ## Runtime database/config inputs
 
 - Database credentials/bootstrap values are provided at runtime only (env or `*_FILE` secret paths), never hardcoded.
-- `./run_app.sh` persists runtime values under `.runtime/` for stable follow-up operations.
+- Plain Compose startup stores generated runtime values in a Docker-managed named volume.
+- `./run_app.sh` can still persist runtime values under `.runtime/` for stable follow-up operations and explicit local overrides.
 - `./run_tests.sh` uses isolated ephemeral runtime values per test run.
 - API config also supports env-or-file loading for DB/app secrets.
 
