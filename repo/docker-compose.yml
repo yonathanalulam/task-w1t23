@@ -1,0 +1,60 @@
+name: ${COMPOSE_PROJECT_NAME:-rrga_${USER:-local}}
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${RRGA_DB_USER:?RRGA_DB_USER must be provided by runtime env or wrapper}
+      POSTGRES_PASSWORD: ${RRGA_DB_PASSWORD:?RRGA_DB_PASSWORD must be provided by runtime env or wrapper}
+      POSTGRES_DB: ${RRGA_DB_NAME:?RRGA_DB_NAME must be provided by runtime env or wrapper}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      PGHOST: ${RRGA_DB_HOST:-db}
+      PGPORT: ${RRGA_DB_PORT:-5432}
+      PGUSER: ${RRGA_DB_USER:?RRGA_DB_USER must be provided by runtime env or wrapper}
+      PGPASSWORD: ${RRGA_DB_PASSWORD:?RRGA_DB_PASSWORD must be provided by runtime env or wrapper}
+      PGDATABASE: ${RRGA_DB_NAME:?RRGA_DB_NAME must be provided by runtime env or wrapper}
+      LOG_LEVEL: info
+      APP_SESSION_SECRET: ${APP_SESSION_SECRET:?APP_SESSION_SECRET must be provided by runtime env or wrapper}
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?APP_ENCRYPTION_KEY must be provided by runtime env or wrapper}
+    command: bash -lc "./init_db.sh && npm run dev -w @rrga/api"
+    expose:
+      - "3000"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      NODE_ENV: development
+      PORT: 4173
+      ORIGIN: http://localhost
+      API_INTERNAL_BASE_URL: http://api:3000/api/v1
+      PUBLIC_API_BASE_URL: http://api:3000/api/v1
+    command: bash -lc "npm run dev -w @rrga/web"
+    ports:
+      - target: 4173
+        published: ${APP_PORT:-0}
+        host_ip: 127.0.0.1
+
+volumes:
+  pg_data:

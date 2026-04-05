@@ -1,0 +1,30 @@
+{
+  "name": "@rrga/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev --host 0.0.0.0 --port 4173",
+    "build": "svelte-kit sync && vite build",
+    "start": "node build",
+    "preview": "vite preview --host 0.0.0.0 --port 4173",
+    "typecheck": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.1",
+    "@sveltejs/adapter-node": "^5.2.10",
+    "@sveltejs/kit": "^2.15.0",
+    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/svelte": "^5.2.5",
+    "@types/node": "^22.10.2",
+    "jsdom": "^25.0.1",
+    "svelte": "^5.16.0",
+    "svelte-check": "^4.1.2",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.5",
+    "vitest": "^2.1.8"
+  }
+}

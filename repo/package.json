@@ -1,0 +1,23 @@
+{
+  "name": "research-resource-grant-admin",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev -w @rrga/api",
+    "dev:web": "npm run dev -w @rrga/web",
+    "test:api": "npm run test -w @rrga/api",
+    "test:web": "npm run test -w @rrga/web",
+    "test:web:e2e": "npm run test:e2e -w @rrga/web",
+    "test:web:e2e:integrated": "./scripts/run_integrated_e2e.sh",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=24.0.0",
+    "npm": ">=11.0.0"
+  }
+}

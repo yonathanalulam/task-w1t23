@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+.svelte-kit/
+build/
+test-results/
+playwright-report/
+tmp/
+.runtime/
+*.log
+.DS_Store
+
+# local-only env files are prohibited from this repo
+.env
+.env.*
