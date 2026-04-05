@@ -9,6 +9,7 @@ import { assertActorOwnsResource } from '../access-control/object-authorization.
 import { evaluateDeadlineSurface } from './rules.js';
 
 const editableStatuses = new Set(['DRAFT', 'RETURNED_FOR_REVISION', 'BLOCKED_LATE']);
+const documentKeyPattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$';
 
 const toMeta = (request: FastifyRequest) => {
   const userAgentHeader = request.headers['user-agent'];
@@ -54,6 +55,12 @@ const buildDeadlinePayload = (application: DeadlinePayloadSource | null) => {
 
 const isHeldForAdminReview = (version: { securityScanStatus: 'CLEAN' | 'WARNING' | 'HELD'; isAdminReviewRequired: boolean }) => {
   return version.isAdminReviewRequired || version.securityScanStatus === 'HELD';
+};
+
+const assertValidDocumentKey = (documentKey: string) => {
+  if (!new RegExp(documentKeyPattern).test(documentKey)) {
+    throw new HttpError(400, 'INVALID_DOCUMENT_KEY', 'documentKey must use only letters, numbers, dots, underscores, and hyphens.');
+  }
 };
 
 export const researcherRoutes: FastifyPluginAsync = async (app) => {
@@ -118,7 +125,12 @@ export const researcherRoutes: FastifyPluginAsync = async (app) => {
         return reply.code(201).send({ application, deadline: buildDeadlinePayload(application) });
       } catch (error) {
         const message = String(error);
-        if (message.includes('duplicate key value violates unique constraint') || message.includes('applications_policy_id_applicant_user_id_key')) {
+        const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: string }).code ?? '') : '';
+        if (
+          code === 'APPLICATION_PERIOD_DUPLICATE' ||
+          message.includes('duplicate key value violates unique constraint') ||
+          message.includes('applications_policy_id_applicant_user_id_key')
+        ) {
           throw new HttpError(409, 'DUPLICATE_APPLICATION', 'A draft or submission already exists for this policy period.');
         }
         throw error;
@@ -243,6 +255,8 @@ export const researcherRoutes: FastifyPluginAsync = async (app) => {
       throw new HttpError(400, 'DOCUMENT_METADATA_REQUIRED', 'documentKey and label are required form fields.');
     }
 
+    assertValidDocumentKey(documentKey);
+
     const saved = await app.researcherService.addFileVersion({
       applicationId,
       actorUserId: actor.userId,
@@ -267,7 +281,7 @@ export const researcherRoutes: FastifyPluginAsync = async (app) => {
           properties: {
             documentKey: { type: 'string', minLength: 1, maxLength: 80 },
             label: { type: 'string', minLength: 1, maxLength: 180 },
-            externalUrl: { type: 'string', maxLength: 2048 }
+            externalUrl: { type: 'string', format: 'uri', maxLength: 2048 }
           }
         }
       }
@@ -280,6 +294,7 @@ export const researcherRoutes: FastifyPluginAsync = async (app) => {
 
       const applicationId = String((request.params as { applicationId: string }).applicationId);
       const body = request.body as { documentKey: string; label: string; externalUrl: string };
+      assertValidDocumentKey(body.documentKey);
 
       const saved = await app.researcherService.addLinkVersion({
         applicationId,

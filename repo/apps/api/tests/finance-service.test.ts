@@ -20,6 +20,7 @@ const makeInMemoryRepository = () => {
   const now = () => new Date();
 
   const repository = {
+    withTransaction: vi.fn(async (action: (client: object) => Promise<unknown>) => action({})),
     listInvoices: vi.fn(async (filters: { statuses?: string[]; hasOpenException?: boolean } = {}) => {
       let rows = [...invoices.values()];
       if (filters.statuses && filters.statuses.length > 0) {
@@ -32,6 +33,7 @@ const makeInMemoryRepository = () => {
     }),
 
     getInvoiceById: vi.fn(async (invoiceId: string) => invoices.get(invoiceId) ?? null),
+    getInvoiceByIdForUpdate: vi.fn(async (_client: object, invoiceId: string) => invoices.get(invoiceId) ?? null),
 
     createInvoice: vi.fn(async (input: any) => {
       const record = {
@@ -59,6 +61,17 @@ const makeInMemoryRepository = () => {
     }),
 
     updateInvoiceFinancials: vi.fn(async (input: any) => {
+      const invoice = invoices.get(input.invoiceId);
+      if (!invoice) {
+        throw new Error('invoice not found');
+      }
+      invoice.paidAmount = input.paidAmount;
+      invoice.refundedAmount = input.refundedAmount;
+      invoice.status = input.status;
+      invoice.updatedAt = now();
+      return invoice;
+    }),
+    updateInvoiceFinancialsInTransaction: vi.fn(async (_client: object, input: any) => {
       const invoice = invoices.get(input.invoiceId);
       if (!invoice) {
         throw new Error('invoice not found');
@@ -103,6 +116,32 @@ const makeInMemoryRepository = () => {
       payments.set(record.id, record);
       return record;
     }),
+    createPaymentInTransaction: vi.fn(async (_client: object, input: any) => {
+      const duplicate = [...payments.values()].find((entry) => entry.wechatTransactionRef === input.wechatTransactionRef);
+      if (duplicate) {
+        const error = new Error('duplicate');
+        (error as Error & { code?: string }).code = '23505';
+        throw error;
+      }
+
+      const record = {
+        id: `payment-${paymentSeq++}`,
+        invoiceId: input.invoiceId,
+        paymentMethod: input.paymentMethod,
+        wechatTransactionRef: input.wechatTransactionRef,
+        amount: input.amount,
+        receivedAt: input.receivedAt,
+        settlementStatus: 'UNSETTLED',
+        settlementImportId: null,
+        recordedByUserId: input.recordedByUserId,
+        note: input.note ?? null,
+        createdAt: now(),
+        updatedAt: now()
+      };
+
+      payments.set(record.id, record);
+      return record;
+    }),
 
     listInvoicePayments: vi.fn(async (invoiceId: string) => [...payments.values()].filter((row) => row.invoiceId === invoiceId)),
 
@@ -120,6 +159,28 @@ const makeInMemoryRepository = () => {
     }),
 
     createRefund: vi.fn(async (input: any) => {
+      const record = {
+        id: `refund-${refundSeq++}`,
+        invoiceId: input.invoiceId,
+        paymentId: input.paymentId ?? null,
+        amount: input.amount,
+        refundMethod: input.refundMethod,
+        reason: input.reason,
+        wechatRefundReference: input.wechatRefundReference ?? null,
+        bankAccountName: input.bankAccountName ?? null,
+        bankRoutingNumberEncrypted: input.bankRoutingNumberEncrypted ?? null,
+        bankAccountNumberEncrypted: input.bankAccountNumberEncrypted ?? null,
+        bankAccountLast4: input.bankAccountLast4 ?? null,
+        recordedByUserId: input.recordedByUserId,
+        refundedAt: input.refundedAt,
+        createdAt: now(),
+        updatedAt: now()
+      };
+
+      refunds.set(record.id, record);
+      return record;
+    }),
+    createRefundInTransaction: vi.fn(async (_client: object, input: any) => {
       const record = {
         id: `refund-${refundSeq++}`,
         invoiceId: input.invoiceId,
@@ -254,7 +315,30 @@ const makeInMemoryRepository = () => {
 
     getPaymentById: vi.fn(async (paymentId: string) => payments.get(paymentId) ?? null),
 
+    getPaymentByIdForInvoice: vi.fn(async (paymentId: string, invoiceId: string) => {
+      const payment = payments.get(paymentId) ?? null;
+      return payment && payment.invoiceId === invoiceId ? payment : null;
+    }),
+
     createLedgerEntry: vi.fn(async (input: any) => {
+      const record = {
+        id: ledgerSeq++,
+        invoiceId: input.invoiceId ?? null,
+        paymentId: input.paymentId ?? null,
+        refundId: input.refundId ?? null,
+        settlementRowId: input.settlementRowId ?? null,
+        entryType: input.entryType,
+        amount: input.amount ?? null,
+        currencyCode: input.currencyCode,
+        actorUserId: input.actorUserId,
+        actorUsername: null,
+        details: input.details,
+        createdAt: now()
+      };
+      ledger.push(record);
+      return record;
+    }),
+    createLedgerEntryInTransaction: vi.fn(async (_client: object, input: any) => {
       const record = {
         id: ledgerSeq++,
         invoiceId: input.invoiceId ?? null,
@@ -383,6 +467,54 @@ describe('finance service', () => {
     expect(detail.refunds[0]?.bankAccountName).toBeNull();
   });
 
+  it('rejects refunds when payment belongs to a different invoice', async () => {
+    const { repository } = makeInMemoryRepository();
+    const service = createFinanceService({
+      repository: repository as never,
+      audit: { write: vi.fn(async () => undefined) },
+      encryptionKey: 'finance-secret-key'
+    });
+
+    const invoiceA = await service.createInvoice({
+      actorUserId: 'clerk-1',
+      serviceType: 'OTHER',
+      description: 'Invoice A',
+      totalAmount: '100.00',
+      meta: {}
+    });
+
+    const invoiceB = await service.createInvoice({
+      actorUserId: 'clerk-1',
+      serviceType: 'OTHER',
+      description: 'Invoice B',
+      totalAmount: '100.00',
+      meta: {}
+    });
+
+    const payment = await service.recordPayment({
+      actorUserId: 'clerk-1',
+      invoiceId: invoiceB.id,
+      amount: '100.00',
+      wechatTransactionRef: 'wechat-cross-invoice-001',
+      receivedAt: '2026-02-01T10:00:00.000Z',
+      meta: {}
+    });
+
+    await expect(
+      service.recordRefund({
+        actorUserId: 'clerk-1',
+        invoiceId: invoiceA.id,
+        paymentId: payment.payment.id,
+        amount: '10.00',
+        refundMethod: 'WECHAT_OFFLINE',
+        reason: 'Invalid cross invoice refund',
+        refundedAt: '2026-02-02T12:00:00.000Z',
+        wechatRefundReference: 'wechat-refund-cross-001',
+        meta: {}
+      })
+    ).rejects.toHaveProperty('code', 'PAYMENT_INVOICE_MISMATCH');
+  });
+
   it('reconciles settlement imports and surfaces unmatched/mismatch exception queue', async () => {
     const { repository } = makeInMemoryRepository();
     const service = createFinanceService({
@@ -492,6 +624,78 @@ describe('finance service', () => {
         meta: {}
       })
     ).rejects.toHaveProperty('code', 'INVALID_SETTLEMENT_CSV_HEADER');
+  });
+
+  it('parses settlement CSV rows with quoted commas', async () => {
+    const { repository } = makeInMemoryRepository();
+    const service = createFinanceService({
+      repository: repository as never,
+      audit: { write: vi.fn(async () => undefined) },
+      encryptionKey: 'finance-secret-key'
+    });
+
+    const invoice = await service.createInvoice({
+      actorUserId: 'clerk-1',
+      serviceType: 'OTHER',
+      description: 'Quoted CSV invoice',
+      totalAmount: '10.00',
+      meta: {}
+    });
+
+    await service.recordPayment({
+      actorUserId: 'clerk-1',
+      invoiceId: invoice.id,
+      amount: '10.00',
+      wechatTransactionRef: 'wechat,quoted-001',
+      receivedAt: '2026-03-01T08:00:00.000Z',
+      meta: {}
+    });
+
+    const result = await service.importSettlementCsv({
+      actorUserId: 'clerk-1',
+      sourceLabel: 'quoted.csv',
+      csvText: 'wechatTransactionRef,amount,settledAt\n"wechat,quoted-001",10.00,2026-03-05T10:00:00.000Z',
+      meta: {}
+    });
+
+    expect(result.import.matchedCount).toBe(1);
+    expect((result.rows[0] as any)?.wechatTransactionRef).toBe('wechat,quoted-001');
+  });
+
+  it('parses settlement CSV rows with quoted embedded newlines', async () => {
+    const { repository } = makeInMemoryRepository();
+    const service = createFinanceService({
+      repository: repository as never,
+      audit: { write: vi.fn(async () => undefined) },
+      encryptionKey: 'finance-secret-key'
+    });
+
+    const invoice = await service.createInvoice({
+      actorUserId: 'clerk-1',
+      serviceType: 'OTHER',
+      description: 'Newline CSV invoice',
+      totalAmount: '15.00',
+      meta: {}
+    });
+
+    await service.recordPayment({
+      actorUserId: 'clerk-1',
+      invoiceId: invoice.id,
+      amount: '15.00',
+      wechatTransactionRef: 'wechat-newline-001',
+      receivedAt: '2026-03-01T08:00:00.000Z',
+      meta: {}
+    });
+
+    const result = await service.importSettlementCsv({
+      actorUserId: 'clerk-1',
+      sourceLabel: 'newline.csv',
+      csvText: 'wechatTransactionRef,amount,settledAt\nwechat-newline-001,15.00,"2026-03-05T10:00:00.000Z\n"',
+      meta: {}
+    });
+
+    expect(result.import.matchedCount).toBe(1);
+    expect((result.rows[0] as any)?.settledAt?.toISOString()).toBe('2026-03-05T10:00:00.000Z');
   });
 
   it('supports explicit resolve and close lifecycle for reconciliation exceptions', async () => {

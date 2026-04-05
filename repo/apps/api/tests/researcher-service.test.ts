@@ -22,13 +22,39 @@ const baseApplication = {
 };
 
 const makeRepository = () => {
-  const appState = { ...baseApplication };
+  const appState: any = { ...baseApplication };
+  const versionCounts = new Map<string, number>([['app-1:budget', 1], ['app-1:supporting-link', 0], ['app-1:concurrent-link', 19]]);
+  let linkVersionSeq = 2;
+  let fileVersionSeq = 2;
+  let transactionChain = Promise.resolve();
 
   const repository = {
+    withTransaction: vi.fn(async (action: (client: object) => Promise<unknown>) => {
+      const run = async () => action({});
+      const next = transactionChain.then(run, run);
+      transactionChain = next.then(() => undefined, () => undefined);
+      return next;
+    }),
+    lockApplicantForSubmission: vi.fn(async () => undefined),
     getApplicationById: vi.fn(async (_applicationId: string) => ({ ...appState })),
-    countOtherApplicationsByPolicy: vi.fn(async () => 0),
+    getApplicationByIdForUpdate: vi.fn(async (_client: object, _applicationId: string) => ({ ...appState })),
+    countOtherApplicationsInOverlappingPeriod: vi.fn(async () => 0),
+    countOtherApplicationsInOverlappingPeriodInTransaction: vi.fn(async (_client: object) => 0),
     insertValidation: vi.fn(async () => undefined),
+    insertValidationInTransaction: vi.fn(async () => undefined),
     getPolicyById: vi.fn(async () => ({
+      id: 'policy-1',
+      title: 'Policy A',
+      description: null,
+      periodStart: '2026-01-01',
+      periodEnd: '2026-12-31',
+      submissionDeadlineAt: new Date('2030-01-01T00:00:00.000Z'),
+      graceHours: 24,
+      annualCapAmount: '5000.00',
+      isActive: true,
+      templates: [{ id: 'tpl-1', templateKey: 'budget', label: 'Budget Sheet', instructions: null, isRequired: true }]
+    })),
+    getPolicyByIdInTransaction: vi.fn(async () => ({
       id: 'policy-1',
       title: 'Policy A',
       description: null,
@@ -55,14 +81,37 @@ const makeRepository = () => {
         latestIsPreviewable: true
       }
     ]),
+    listDocumentsInTransaction: vi.fn(async () => [
+      {
+        id: 'doc-1',
+        applicationId: 'app-1',
+        documentKey: 'budget',
+        label: 'Budget Sheet',
+        latestVersionId: 'v-1',
+        latestVersionNumber: 1,
+        latestStorageType: 'FILE',
+        latestMimeType: 'application/pdf',
+        latestFileName: 'budget.pdf',
+        latestExternalUrl: null,
+        latestIsPreviewable: true
+      }
+    ]),
     sumYearlySubmittedAmounts: vi.fn(async () => 1000),
+    sumYearlySubmittedAmountsInTransaction: vi.fn(async (_client: object) => 1000),
     updateApplicationStatus: vi.fn(async (_input) => {
       appState.status = _input.nextStatus;
       if (_input.markSubmittedAt) {
         appState.submittedAt = new Date();
       }
     }),
+    updateApplicationStatusInTransaction: vi.fn(async (_client: object, _input: any) => {
+      appState.status = _input.nextStatus;
+      if (_input.markSubmittedAt) {
+        appState.submittedAt = new Date();
+      }
+    }),
     markExtensionUsed: vi.fn(async () => undefined),
+    markExtensionUsedInTransaction: vi.fn(async () => undefined),
     findDocumentById: vi.fn(async () => ({
       id: 'doc-1',
       applicationId: 'app-1',
@@ -91,74 +140,98 @@ const makeRepository = () => {
     })),
     rollbackDocumentVersion: vi.fn(async () => undefined),
     createExtension: vi.fn(async () => undefined),
-    countDocumentVersions: vi.fn(async () => 1),
-    addLinkDocumentVersion: vi.fn(async () => ({
-      document: {
-        id: 'doc-2',
-        applicationId: 'app-1',
-        documentKey: 'supporting-link',
-        label: 'Supplement Link',
-        latestVersionId: 'v-2',
-        latestVersionNumber: 1,
-        latestStorageType: 'LINK',
-        latestMimeType: null,
-        latestFileName: null,
-        latestExternalUrl: 'https://example.org/resource',
-        latestIsPreviewable: false
-      },
-      version: {
-        id: 'v-2',
-        documentId: 'doc-2',
-        versionNumber: 1,
-        storageType: 'LINK',
-        filePath: null,
-        fileName: null,
-        mimeType: null,
-        sizeBytes: null,
-        externalUrl: 'https://example.org/resource',
-        isPreviewable: false,
-        detectedMimeType: null,
-        securityScanStatus: 'CLEAN',
-        securityFindings: [],
-        isAdminReviewRequired: false,
-        createdAt: new Date()
+    countDocumentVersions: vi.fn(async (documentId: string) => (documentId === 'doc-cap' ? 20 : 1)),
+    addLinkDocumentVersion: vi.fn(async (input: any) => {
+      const key = `${input.applicationId}:${input.documentKey}`;
+      const current = versionCounts.get(key) ?? 0;
+      if (current >= 20) {
+        const error = new Error('limit reached');
+        (error as Error & { code?: string }).code = 'DOCUMENT_VERSION_LIMIT_REACHED';
+        throw error;
       }
-    })),
-    addFileDocumentVersion: vi.fn(async () => ({
-      document: {
-        id: 'doc-file-1',
-        applicationId: 'app-1',
-        documentKey: 'budget',
-        label: 'Budget Sheet',
-        latestVersionId: 'v-file-1',
-        latestVersionNumber: 2,
-        latestStorageType: 'FILE',
-        latestMimeType: 'application/pdf',
-        latestFileName: 'budget.pdf',
-        latestExternalUrl: null,
-        latestIsPreviewable: true,
-        latestSecurityScanStatus: 'WARNING',
-        latestSecurityFindings: ['credential_pattern_detected'],
-        latestAdminReviewRequired: false
-      },
-      version: {
-        id: 'v-file-1',
-        documentId: 'doc-file-1',
-        versionNumber: 2,
-        storageType: 'FILE',
-        filePath: '/tmp/budget.pdf',
-        fileName: 'budget.pdf',
-        mimeType: 'application/pdf',
-        sizeBytes: 150,
-        externalUrl: null,
-        isPreviewable: true,
-        detectedMimeType: 'application/pdf',
-        securityScanStatus: 'WARNING',
-        securityFindings: ['credential_pattern_detected'],
-        isAdminReviewRequired: false,
-        createdAt: new Date()
+
+      const nextVersion = current + 1;
+      versionCounts.set(key, nextVersion);
+      return {
+        document: {
+          id: 'doc-2',
+          applicationId: input.applicationId,
+          documentKey: input.documentKey,
+          label: input.label,
+          latestVersionId: `v-link-${linkVersionSeq}`,
+          latestVersionNumber: nextVersion,
+          latestStorageType: 'LINK',
+          latestMimeType: null,
+          latestFileName: null,
+          latestExternalUrl: input.externalUrl,
+          latestIsPreviewable: false
+        },
+        version: {
+          id: `v-link-${linkVersionSeq++}`,
+          documentId: 'doc-2',
+          versionNumber: nextVersion,
+          storageType: 'LINK',
+          filePath: null,
+          fileName: null,
+          mimeType: null,
+          sizeBytes: null,
+          externalUrl: input.externalUrl,
+          isPreviewable: false,
+          detectedMimeType: null,
+          securityScanStatus: 'CLEAN',
+          securityFindings: [],
+          isAdminReviewRequired: false,
+          createdAt: new Date()
+        }
+      };
+    }),
+    addFileDocumentVersion: vi.fn(async (input: any) => {
+      const key = `${input.applicationId}:${input.documentKey}`;
+      const current = versionCounts.get(key) ?? 0;
+      if (current >= 20) {
+        const error = new Error('limit reached');
+        (error as Error & { code?: string }).code = 'DOCUMENT_VERSION_LIMIT_REACHED';
+        throw error;
       }
-    }))
+
+      const nextVersion = current + 1;
+      versionCounts.set(key, nextVersion);
+      return {
+        document: {
+          id: 'doc-file-1',
+          applicationId: input.applicationId,
+          documentKey: input.documentKey,
+          label: input.label,
+          latestVersionId: `v-file-${fileVersionSeq}`,
+          latestVersionNumber: nextVersion,
+          latestStorageType: 'FILE',
+          latestMimeType: 'application/pdf',
+          latestFileName: 'budget.pdf',
+          latestExternalUrl: null,
+          latestIsPreviewable: true,
+          latestSecurityScanStatus: 'WARNING',
+          latestSecurityFindings: ['credential_pattern_detected'],
+          latestAdminReviewRequired: false
+        },
+        version: {
+          id: `v-file-${fileVersionSeq++}`,
+          documentId: 'doc-file-1',
+          versionNumber: nextVersion,
+          storageType: 'FILE',
+          filePath: '/tmp/budget.pdf',
+          fileName: 'budget.pdf',
+          mimeType: 'application/pdf',
+          sizeBytes: 150,
+          externalUrl: null,
+          isPreviewable: true,
+          detectedMimeType: 'application/pdf',
+          securityScanStatus: 'WARNING',
+          securityScanFindings: ['credential_pattern_detected'],
+          isAdminReviewRequired: false,
+          createdAt: new Date()
+        }
+      };
+    })
   };
 
   return { repository, appState };
@@ -167,7 +240,7 @@ const makeRepository = () => {
 describe('researcher service submission rules', () => {
   it('rejects duplicate applications in same policy period', async () => {
     const { repository } = makeRepository();
-    repository.countOtherApplicationsByPolicy.mockResolvedValueOnce(1);
+    repository.countOtherApplicationsInOverlappingPeriodInTransaction.mockResolvedValueOnce(1);
 
     const service = createResearcherService({
       repository: repository as never,
@@ -181,7 +254,7 @@ describe('researcher service submission rules', () => {
 
   it('rejects when annual cap is exceeded', async () => {
     const { repository } = makeRepository();
-    repository.sumYearlySubmittedAmounts.mockResolvedValueOnce(4500);
+    repository.sumYearlySubmittedAmountsInTransaction.mockResolvedValueOnce(4500);
 
     const service = createResearcherService({
       repository: repository as never,
@@ -207,7 +280,8 @@ describe('researcher service submission rules', () => {
       service.submitApplication({ applicationId: 'app-1', actorUserId: 'user-1', mode: 'submit', meta: {} })
     ).rejects.toHaveProperty('code', 'SUBMISSION_BLOCKED_LATE');
 
-    expect(repository.updateApplicationStatus).toHaveBeenCalledWith(
+    expect(repository.updateApplicationStatusInTransaction).toHaveBeenCalledWith(
+      expect.anything(),
       expect.objectContaining({ nextStatus: 'BLOCKED_LATE' })
     );
   });
@@ -230,7 +304,7 @@ describe('researcher service submission rules', () => {
       meta: {}
     });
 
-    expect(repository.markExtensionUsed).toHaveBeenCalledWith('app-1');
+    expect(repository.markExtensionUsedInTransaction).toHaveBeenCalledWith(expect.anything(), 'app-1');
     expect(submitted?.status).toBe('SUBMITTED_LATE');
   });
 });
@@ -238,22 +312,7 @@ describe('researcher service submission rules', () => {
 describe('researcher service document version controls', () => {
   it('enforces max 20 versions for link document', async () => {
     const { repository } = makeRepository();
-    repository.listDocuments.mockResolvedValueOnce([
-      {
-        id: 'doc-cap',
-        applicationId: 'app-1',
-        documentKey: 'supporting-link',
-        label: 'Support Link',
-        latestVersionId: 'v-cap',
-        latestVersionNumber: 20,
-        latestStorageType: 'LINK',
-        latestMimeType: null,
-        latestFileName: null,
-        latestExternalUrl: 'https://example.org',
-        latestIsPreviewable: false
-      }
-    ]);
-    repository.countDocumentVersions.mockResolvedValueOnce(20);
+    repository.addLinkDocumentVersion.mockRejectedValueOnce(Object.assign(new Error('limit reached'), { code: 'DOCUMENT_VERSION_LIMIT_REACHED' }));
 
     const service = createResearcherService({
       repository: repository as never,
@@ -270,6 +329,51 @@ describe('researcher service document version controls', () => {
         meta: {}
       })
     ).rejects.toHaveProperty('code', 'DOCUMENT_VERSION_LIMIT_REACHED');
+  });
+
+  it('keeps the 20-version cap under concurrent uploads', async () => {
+    const { repository } = makeRepository();
+    const service = createResearcherService({
+      repository: repository as never,
+      audit: { write: vi.fn(async () => undefined) }
+    });
+
+    const attempts = await Promise.allSettled(
+      Array.from({ length: 2 }, (_, index) =>
+        service.addLinkVersion({
+          applicationId: 'app-1',
+          actorUserId: 'user-1',
+          documentKey: 'concurrent-link',
+          label: `Concurrent Link ${index + 1}`,
+          externalUrl: `https://example.org/${index + 1}`,
+          meta: {}
+        })
+      )
+    );
+
+    expect(attempts.filter((entry) => entry.status === 'fulfilled')).toHaveLength(1);
+    expect(attempts.filter((entry) => entry.status === 'rejected')).toHaveLength(1);
+    const rejection = attempts.find((entry) => entry.status === 'rejected');
+    expect((rejection as PromiseRejectedResult | undefined)?.reason?.code).toBe('DOCUMENT_VERSION_LIMIT_REACHED');
+  });
+
+  it('returns bad request for malformed external URLs', async () => {
+    const { repository } = makeRepository();
+    const service = createResearcherService({
+      repository: repository as never,
+      audit: { write: vi.fn(async () => undefined) }
+    });
+
+    await expect(
+      service.addLinkVersion({
+        applicationId: 'app-1',
+        actorUserId: 'user-1',
+        documentKey: 'supporting-link',
+        label: 'Support Link',
+        externalUrl: 'not a url',
+        meta: {}
+      })
+    ).rejects.toHaveProperty('code', 'INVALID_EXTERNAL_URL');
   });
 
   it('allows rollback for editable application state', async () => {

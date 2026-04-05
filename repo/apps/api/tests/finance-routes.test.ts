@@ -4,7 +4,7 @@ import { financeRoutes } from '../src/modules/finance/routes.js';
 import { registerErrorEnvelope } from '../src/plugins/error-envelope.js';
 
 describe('finance routes RBAC boundaries', () => {
-  const apps: Array<Awaited<ReturnType<typeof buildTestApp>>> = [];
+  const apps: Array<{ close: () => Promise<void> }> = [];
 
   afterEach(async () => {
     while (apps.length > 0) {
@@ -36,6 +36,7 @@ describe('finance routes RBAC boundaries', () => {
     app.decorate('financeService', financeService);
 
     app.addHook('onRequest', async (request) => {
+      const authRequest = request as typeof request & { auth: any };
       const userId = request.headers['x-test-user-id'];
       const roles = String(request.headers['x-test-roles'] ?? '')
         .split(',')
@@ -43,11 +44,11 @@ describe('finance routes RBAC boundaries', () => {
         .filter(Boolean);
 
       if (!userId || roles.length === 0) {
-        request.auth = null;
+        authRequest.auth = null;
         return;
       }
 
-      request.auth = {
+      authRequest.auth = {
         userId: String(userId),
         username: 'tester',
         roles: roles as never,
@@ -176,5 +177,67 @@ describe('finance routes RBAC boundaries', () => {
     expect(financeService.resolveSettlementException).toHaveBeenCalled();
     expect(financeService.closeSettlementException).toHaveBeenCalled();
     expect(financeService.listLedgerEntries).toHaveBeenCalled();
+  });
+
+  it('returns 400 for invalid decimal invoice amount format', async () => {
+    const { app } = await buildTestApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/finance/invoices',
+      headers: {
+        'x-test-user-id': 'clerk-1',
+        'x-test-roles': 'finance_clerk',
+        'content-type': 'application/json'
+      },
+      payload: {
+        serviceType: 'OTHER',
+        description: 'Invoice',
+        totalAmount: '10.999'
+      }
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('returns 400 for invalid decimal payment amount format', async () => {
+    const { app } = await buildTestApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/finance/invoices/invoice-1/payments',
+      headers: {
+        'x-test-user-id': 'clerk-1',
+        'x-test-roles': 'finance_clerk',
+        'content-type': 'application/json'
+      },
+      payload: {
+        amount: '10.999',
+        wechatTransactionRef: 'wechat-1',
+        receivedAt: '2026-03-01T00:00:00.000Z'
+      }
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('returns 400 for invalid decimal refund amount format', async () => {
+    const { app } = await buildTestApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/finance/invoices/invoice-1/refunds',
+      headers: {
+        'x-test-user-id': 'clerk-1',
+        'x-test-roles': 'finance_clerk',
+        'content-type': 'application/json'
+      },
+      payload: {
+        amount: '10.999',
+        refundMethod: 'WECHAT_OFFLINE',
+        reason: 'Refund',
+        refundedAt: '2026-03-01T00:00:00.000Z',
+        wechatRefundReference: 'refund-1'
+      }
+    });
+
+    expect(response.statusCode).toBe(400);
   });
 });

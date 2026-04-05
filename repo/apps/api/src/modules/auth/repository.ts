@@ -40,6 +40,7 @@ const toAuthSession = (row: Record<string, unknown>): AuthSessionRecord => {
 
 export interface AuthRepository {
   countUsers(): Promise<number>;
+  createInitialUserWithRole(username: string, passwordHash: string, roleCode: UserRole): Promise<{ userId: string; username: string; roles: UserRole[] } | null>;
   createUserWithRole(username: string, passwordHash: string, roleCode: UserRole): Promise<{ userId: string; username: string; roles: UserRole[] }>;
   findUserByUsername(username: string): Promise<AuthUserRecord | null>;
   findUserById(userId: string): Promise<AuthUserRecord | null>;
@@ -100,6 +101,52 @@ export const createAuthRepository = (pool: Pool): AuthRepository => {
 
         if (!role) {
           throw new Error(`Role ${roleCode} not found`);
+        }
+
+        await client.query('INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)', [user.id, role.id]);
+        await client.query('COMMIT');
+
+        return {
+          userId: user.id,
+          username: user.username,
+          roles: [role.code]
+        };
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+
+    async createInitialUserWithRole(username, passwordHash, roleCode) {
+      const client = await pool.connect();
+
+      try {
+        await client.query('BEGIN');
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended('auth_bootstrap_admin', 0))");
+
+        const roleResult = await client.query<{ id: number; code: UserRole }>('SELECT id, code FROM roles WHERE code = $1', [roleCode]);
+        const role = roleResult.rows[0];
+
+        if (!role) {
+          throw new Error(`Role ${roleCode} not found`);
+        }
+
+        const userResult = await client.query<{ id: string; username: string }>(
+          `
+            INSERT INTO users (username, password_hash)
+            SELECT $1, $2
+            WHERE NOT EXISTS (SELECT 1 FROM users)
+            RETURNING id, username
+          `,
+          [username, passwordHash]
+        );
+
+        const user = userResult.rows[0];
+        if (!user) {
+          await client.query('ROLLBACK');
+          return null;
         }
 
         await client.query('INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)', [user.id, role.id]);

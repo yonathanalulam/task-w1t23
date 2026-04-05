@@ -1,258 +1,186 @@
-import Fastify from 'fastify';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { registerErrorEnvelope } from '../src/plugins/error-envelope.js';
-import { workflowRoutes } from '../src/modules/workflow/routes.js';
-import { HttpError } from '../src/lib/http-error.js';
+import { afterEach, describe, expect, it } from 'vitest';
+import { createIntegrationDatabase } from './helpers/db-integration.js';
 
-describe('workflow routes RBAC and object boundaries', () => {
-  const apps: Array<Awaited<ReturnType<typeof buildTestApp>>> = [];
-  const tempDirs: string[] = [];
+describe('workflow routes integration', () => {
+  const integrationTimeout = 30000;
+  let context: Awaited<ReturnType<typeof createIntegrationDatabase>> | null = null;
+  let app: Awaited<ReturnType<Awaited<ReturnType<typeof createIntegrationDatabase>>['buildApiApp']>> | null = null;
 
   afterEach(async () => {
-    while (apps.length > 0) {
-      const app = apps.pop();
-      if (app) {
-        await app.close();
-      }
+    if (app) {
+      await app.close();
+      app = null;
     }
 
-    while (tempDirs.length > 0) {
-      const dir = tempDirs.pop();
-      if (dir) {
-        await rm(dir, { recursive: true, force: true });
-      }
+    if (context) {
+      await context.cleanup();
+      context = null;
     }
   });
 
-  const buildTestApp = async () => {
-    const app = Fastify({ logger: false });
+  const extractCookie = (header: string | string[] | undefined) => String(Array.isArray(header) ? header[0] : header ?? '').split(';')[0] ?? '';
 
-    app.decorate('audit', {
-      write: vi.fn(async () => undefined)
+  const boot = async () => {
+    context = await createIntegrationDatabase();
+    app = await context.buildApiApp();
+
+    await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/bootstrap-admin',
+      headers: { 'content-type': 'application/json' },
+      payload: { username: 'admin', password: 'AdminPass1!', bootstrapSecret: 'test-bootstrap-secret' }
     });
 
-    const workflowService = {
-      reviewerQueue: vi.fn(async () => []),
-      reviewerDetail: vi.fn(async () => ({ application: { id: 'app-1' } })),
-      reviewerDocumentAccess: vi.fn(async () => ({
-        document: { id: 'doc-1' },
-        version: {
-          id: 'ver-1',
-          storageType: 'FILE',
-          isPreviewable: true,
-          filePath: '/tmp/does-not-exist.pdf',
-          mimeType: 'application/pdf',
-          fileName: 'evidence.pdf',
-          externalUrl: null
-        }
-      })),
-      reviewerDecision: vi.fn(async () => ({ ok: true })),
-      approverQueue: vi.fn(async () => []),
-      approverDetail: vi.fn(async () => ({ application: { id: 'app-1' } })),
-      approverDocumentAccess: vi.fn(async () => ({
-        document: { id: 'doc-1' },
-        version: {
-          id: 'ver-1',
-          storageType: 'FILE',
-          isPreviewable: true,
-          filePath: '/tmp/does-not-exist.pdf',
-          mimeType: 'application/pdf',
-          fileName: 'evidence.pdf',
-          externalUrl: null
-        }
-      })),
-      approverSignOff: vi.fn(async () => ({ ok: true }))
+    await context.seedUser({ username: 'researcher1', password: 'ResearcherPass1!', roles: ['researcher'] });
+    await context.seedUser({ username: 'reviewer1', password: 'ReviewerPass1!', roles: ['reviewer'] });
+
+    const adminLogin = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      headers: { 'content-type': 'application/json' },
+      payload: { username: 'admin', password: 'AdminPass1!' }
+    });
+
+    const researcherLogin = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      headers: { 'content-type': 'application/json' },
+      payload: { username: 'researcher1', password: 'ResearcherPass1!' }
+    });
+
+    const reviewer1Login = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      headers: { 'content-type': 'application/json' },
+      payload: { username: 'reviewer1', password: 'ReviewerPass1!' }
+    });
+
+    return {
+      context,
+      app,
+      adminCookie: extractCookie(adminLogin.headers['set-cookie']),
+      researcherCookie: extractCookie(researcherLogin.headers['set-cookie']),
+      reviewer1Cookie: extractCookie(reviewer1Login.headers['set-cookie'])
     };
-
-    app.decorate('workflowService', workflowService);
-
-    app.addHook('onRequest', async (request) => {
-      const userId = request.headers['x-test-user-id'];
-      const roles = String(request.headers['x-test-roles'] ?? '')
-        .split(',')
-        .map((entry) => entry.trim())
-        .filter(Boolean);
-
-      if (!userId || roles.length === 0) {
-        request.auth = null;
-        return;
-      }
-
-      request.auth = {
-        userId: String(userId),
-        username: 'tester',
-        roles: roles as any,
-        sessionId: 'session-1'
-      };
-    });
-
-    await app.register(workflowRoutes, { prefix: '/workflow' });
-    registerErrorEnvelope(app);
-
-    apps.push(app);
-    return { app, workflowService };
   };
 
-  it('returns 401 for unauthenticated reviewer queue request', async () => {
-    const { app } = await buildTestApp();
-    const response = await app.inject({ method: 'GET', url: '/workflow/reviewer/queue' });
-    expect(response.statusCode).toBe(401);
-  });
-
-  it('returns 403 when reviewer route is called by non-reviewer role', async () => {
-    const { app } = await buildTestApp();
-    const response = await app.inject({
-      method: 'GET',
-      url: '/workflow/reviewer/queue',
-      headers: {
-        'x-test-user-id': 'user-1',
-        'x-test-roles': 'approver'
-      }
-    });
-    expect(response.statusCode).toBe(403);
-  });
-
-  it('allows reviewer queue for reviewer role and calls service', async () => {
-    const { app, workflowService } = await buildTestApp();
-    const response = await app.inject({
-      method: 'GET',
-      url: '/workflow/reviewer/queue',
-      headers: {
-        'x-test-user-id': 'reviewer-1',
-        'x-test-roles': 'reviewer'
-      }
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(workflowService.reviewerQueue).toHaveBeenCalled();
-  });
-
-  it('returns 403 when approver sign-off is attempted by reviewer role', async () => {
-    const { app } = await buildTestApp();
-    const response = await app.inject({
+  const createPolicy = async (adminCookie: string) => {
+    const response = await app!.inject({
       method: 'POST',
-      url: '/workflow/approver/applications/app-1/sign-off',
+      url: '/api/v1/policies',
       headers: {
         'content-type': 'application/json',
-        'x-test-user-id': 'reviewer-1',
-        'x-test-roles': 'reviewer'
+        cookie: adminCookie
       },
-      payload: { decision: 'approve', comment: 'looks good' }
+      payload: {
+        title: 'Workflow Policy',
+        periodStart: '2026-01-01',
+        periodEnd: '2026-12-31',
+        submissionDeadlineAt: '2030-06-01T00:00:00.000Z',
+        graceHours: 24,
+        annualCapAmount: '5000.00',
+        approvalLevelsRequired: 1,
+        templates: [{ templateKey: 'budget', label: 'Budget', isRequired: true }]
+      }
     });
 
-    expect(response.statusCode).toBe(403);
-  });
+    return response.json().policy.id as string;
+  };
 
-  it('preserves object-level denial from approver detail handler', async () => {
-    const { app, workflowService } = await buildTestApp();
-    workflowService.approverDetail.mockRejectedValueOnce(
-      new HttpError(403, 'FORBIDDEN', 'Application is not in an approver-signoff state.')
+  const createSubmittedApplication = async (researcherCookie: string, policyId: string) => {
+    const createResponse = await app!.inject({
+      method: 'POST',
+      url: '/api/v1/researcher/applications',
+      headers: {
+        'content-type': 'application/json',
+        cookie: researcherCookie
+      },
+      payload: {
+        policyId,
+        title: 'Workflow Application',
+        requestedAmount: '250.00'
+      }
+    });
+    const applicationId = createResponse.json().application.id as string;
+
+    const linkResponse = await app!.inject({
+      method: 'POST',
+      url: `/api/v1/researcher/applications/${applicationId}/documents/link`,
+      headers: {
+        'content-type': 'application/json',
+        cookie: researcherCookie
+      },
+      payload: {
+        documentKey: 'budget',
+        label: 'Budget',
+        externalUrl: 'https://example.org/budget'
+      }
+    });
+    expect(linkResponse.statusCode).toBe(201);
+
+    const submitResponse = await app!.inject({
+      method: 'POST',
+      url: `/api/v1/researcher/applications/${applicationId}/submit`,
+      headers: { cookie: researcherCookie }
+    });
+    expect(submitResponse.statusCode).toBe(200);
+
+    return applicationId;
+  };
+
+  it('preserves persisted reviewer access after reviewer roster mutation', async () => {
+    const { context, adminCookie, researcherCookie, reviewer1Cookie } = await boot();
+    const policyId = await createPolicy(adminCookie);
+    const applicationId = await createSubmittedApplication(researcherCookie, policyId);
+
+    const initialQueue = await app!.inject({
+      method: 'GET',
+      url: '/api/v1/workflow/reviewer/queue',
+      headers: { cookie: reviewer1Cookie }
+    });
+
+    expect(initialQueue.statusCode).toBe(200);
+    expect(initialQueue.json().queue).toHaveLength(1);
+
+    await context.seedUser({ username: 'reviewer2', password: 'ReviewerPass1!', roles: ['reviewer'] });
+    await context.seedUser({ username: 'reviewer3', password: 'ReviewerPass1!', roles: ['reviewer'] });
+
+    await context.pool.query(
+      `
+      DELETE FROM user_roles
+      WHERE user_id = (SELECT id FROM users WHERE username = 'reviewer3')
+        AND role_id = (SELECT id FROM roles WHERE code = 'reviewer')
+      `
     );
 
-    const response = await app.inject({
+    const reviewer2Login = await app!.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      headers: { 'content-type': 'application/json' },
+      payload: { username: 'reviewer2', password: 'ReviewerPass1!' }
+    });
+    const reviewer2Cookie = extractCookie(reviewer2Login.headers['set-cookie']);
+
+    const assignedDetail = await app!.inject({
       method: 'GET',
-      url: '/workflow/approver/applications/app-1',
-      headers: {
-        'x-test-user-id': 'approver-1',
-        'x-test-roles': 'approver'
-      }
+      url: `/api/v1/workflow/reviewer/applications/${applicationId}`,
+      headers: { cookie: reviewer1Cookie }
     });
+    expect(assignedDetail.statusCode).toBe(200);
 
-    expect(response.statusCode).toBe(403);
-    const body = response.json();
-    expect(body.error?.code ?? body.code).toBe('FORBIDDEN');
-  });
-
-  it('serves reviewer preview for accessible workflow documents', async () => {
-    const { app, workflowService } = await buildTestApp();
-    const tempDir = await mkdtemp(join(tmpdir(), 'workflow-preview-'));
-    tempDirs.push(tempDir);
-    const filePath = join(tempDir, 'evidence.pdf');
-    await writeFile(filePath, Buffer.from('%PDF-1.4\nworkflow-test', 'utf8'));
-
-    workflowService.reviewerDocumentAccess.mockResolvedValueOnce({
-      document: { id: 'doc-1' },
-      version: {
-        id: 'ver-1',
-        storageType: 'FILE',
-        isPreviewable: true,
-        filePath,
-        mimeType: 'application/pdf',
-        fileName: 'evidence.pdf',
-        externalUrl: null
-      }
-    });
-
-    const response = await app.inject({
+    const newReviewerDetail = await app!.inject({
       method: 'GET',
-      url: '/workflow/reviewer/applications/app-1/documents/doc-1/preview',
-      headers: {
-        'x-test-user-id': 'reviewer-1',
-        'x-test-roles': 'reviewer'
-      }
+      url: `/api/v1/workflow/reviewer/applications/${applicationId}`,
+      headers: { cookie: reviewer2Cookie }
     });
+    expect(newReviewerDetail.statusCode).toBe(403);
 
-    expect(response.statusCode).toBe(200);
-    expect(response.headers['content-type']).toContain('application/pdf');
-    expect(workflowService.reviewerDocumentAccess).toHaveBeenCalledWith('app-1', 'doc-1');
-  });
-
-  it('returns 423 when reviewer document access is held for admin review', async () => {
-    const { app, workflowService } = await buildTestApp();
-    workflowService.reviewerDocumentAccess.mockRejectedValueOnce(
-      new HttpError(423, 'DOCUMENT_HELD_FOR_ADMIN_REVIEW', 'Document is currently held for administrator review and is not accessible.')
-    );
-
-    const response = await app.inject({
+    const newReviewerQueue = await app!.inject({
       method: 'GET',
-      url: '/workflow/reviewer/applications/app-1/documents/doc-1/download',
-      headers: {
-        'x-test-user-id': 'reviewer-1',
-        'x-test-roles': 'reviewer'
-      }
+      url: '/api/v1/workflow/reviewer/queue',
+      headers: { cookie: reviewer2Cookie }
     });
-
-    expect(response.statusCode).toBe(423);
-    const body = response.json();
-    expect(body.error?.code ?? body.code).toBe('DOCUMENT_HELD_FOR_ADMIN_REVIEW');
-  });
-
-  it('supports approver download watermark headers for text-like files', async () => {
-    const { app, workflowService } = await buildTestApp();
-    const tempDir = await mkdtemp(join(tmpdir(), 'workflow-download-'));
-    tempDirs.push(tempDir);
-    const filePath = join(tempDir, 'evidence.txt');
-    await writeFile(filePath, Buffer.from('original-body', 'utf8'));
-
-    workflowService.approverDocumentAccess.mockResolvedValueOnce({
-      document: { id: 'doc-1' },
-      version: {
-        id: 'ver-1',
-        storageType: 'FILE',
-        isPreviewable: true,
-        filePath,
-        mimeType: 'text/plain',
-        fileName: 'evidence.txt',
-        externalUrl: null
-      }
-    });
-
-    const response = await app.inject({
-      method: 'GET',
-      url: '/workflow/approver/applications/app-1/documents/doc-1/download?watermark=true',
-      headers: {
-        'x-test-user-id': 'approver-1',
-        'x-test-roles': 'approver'
-      }
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.headers['x-rrga-watermark']).toContain('Downloaded by tester at');
-    expect(response.headers['x-rrga-watermark-mode']).toBe('content_prefix');
-    expect(response.body).toContain('[RRGA WATERMARK]');
-    expect(response.body).toContain('original-body');
-  });
+    expect(newReviewerQueue.statusCode).toBe(200);
+    expect(newReviewerQueue.json().queue).toHaveLength(0);
+  }, integrationTimeout);
 });

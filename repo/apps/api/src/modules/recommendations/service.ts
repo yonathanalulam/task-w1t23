@@ -195,15 +195,27 @@ export const createRecommendationsService = (deps: { repository: Recommendations
       feedback: Awaited<ReturnType<RecommendationsRepository['listFeedbackByUser']>>;
       recommendations: RecommendationItem[];
     }> {
-      const [preferences, feedbackRows, journals, fundingPrograms, resources] = await Promise.all([
+      const [preferences, feedbackRows, journals, fundingPrograms, resources, recentBookingSignals] = await Promise.all([
         repository.getPreferences(userId),
         repository.listFeedbackByUser(userId),
         repository.listJournalCandidates(),
         repository.listFundingProgramCandidates(),
-        repository.listResourceCandidates()
+        repository.listResourceCandidates(),
+        repository.listRecentBookingSignals(userId)
       ]);
 
       const feedbackByTarget = new Map(feedbackRows.map((entry) => [feedbackKey(entry.targetType, entry.targetId), entry.action] as const));
+      const recentBookingByResourceId = new Map(recentBookingSignals.map((entry) => [entry.resourceId, entry] as const));
+      const recentBookingTypeCounts = new Map<string, number>();
+      const recentBookingLocationCounts = new Map<string, number>();
+
+      for (const signal of recentBookingSignals) {
+        recentBookingTypeCounts.set(signal.resourceType, (recentBookingTypeCounts.get(signal.resourceType) ?? 0) + signal.bookingCount);
+        if (signal.location) {
+          const normalizedLocation = signal.location.toLowerCase();
+          recentBookingLocationCounts.set(normalizedLocation, (recentBookingLocationCounts.get(normalizedLocation) ?? 0) + signal.bookingCount);
+        }
+      }
 
       const recommendations: RecommendationItem[] = [];
 
@@ -298,6 +310,25 @@ export const createRecommendationsService = (deps: { repository: Recommendations
 
         let score = 24;
         const reasons: string[] = ['Resource is active in the current booking catalog.'];
+
+        const exactRecentBooking = recentBookingByResourceId.get(resource.id);
+        if (exactRecentBooking) {
+          score += 22;
+          reasons.push(`You booked this resource ${exactRecentBooking.bookingCount} time(s) recently.`);
+        } else {
+          const recentTypeBookings = recentBookingTypeCounts.get(resource.resourceType) ?? 0;
+          if (recentTypeBookings > 0) {
+            score += 12;
+            reasons.push(`Matches your recent booking activity for ${resource.resourceType.toLowerCase()} resources.`);
+          }
+
+          const normalizedLocation = resource.location?.toLowerCase() ?? null;
+          const recentLocationBookings = normalizedLocation ? (recentBookingLocationCounts.get(normalizedLocation) ?? 0) : 0;
+          if (recentLocationBookings > 0) {
+            score += 6;
+            reasons.push(`Aligns with your recent booking activity in ${resource.location}.`);
+          }
+        }
 
         if (preferences.preferredResourceTypes.includes(resource.resourceType)) {
           score += 18;

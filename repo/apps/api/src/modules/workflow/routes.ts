@@ -33,8 +33,8 @@ export const workflowRoutes: FastifyPluginAsync = async (app) => {
 
     const accessResult =
       input.role === 'reviewer'
-        ? await app.workflowService.reviewerDocumentAccess(input.applicationId, input.documentId)
-        : await app.workflowService.approverDocumentAccess(input.applicationId, input.documentId);
+        ? await app.workflowService.reviewerDocumentAccess(input.applicationId, input.documentId, actor.userId)
+        : await app.workflowService.approverDocumentAccess(input.applicationId, input.documentId, actor.userId);
 
     const { document, version } = accessResult;
 
@@ -131,14 +131,24 @@ export const workflowRoutes: FastifyPluginAsync = async (app) => {
     return input.reply.send(createReadStream(version.filePath));
   };
 
-  app.get('/reviewer/queue', { preHandler: [requireAuthenticated(app), requireRoles(app, ['reviewer'])] }, async () => {
-    const queue = await app.workflowService.reviewerQueue();
+  app.get('/reviewer/queue', { preHandler: [requireAuthenticated(app), requireRoles(app, ['reviewer'])] }, async (request) => {
+    const actor = request.auth;
+    if (!actor) {
+      throw new HttpError(401, 'UNAUTHORIZED', 'Authentication required.');
+    }
+
+    const queue = await app.workflowService.reviewerQueue(actor.userId);
     return { queue };
   });
 
   app.get('/reviewer/applications/:applicationId', { preHandler: [requireAuthenticated(app), requireRoles(app, ['reviewer'])] }, async (request) => {
+    const actor = request.auth;
+    if (!actor) {
+      throw new HttpError(401, 'UNAUTHORIZED', 'Authentication required.');
+    }
+
     const applicationId = String((request.params as { applicationId: string }).applicationId);
-    return app.workflowService.reviewerDetail(applicationId);
+    return app.workflowService.reviewerDetail(applicationId, actor.userId);
   });
 
   app.get(
@@ -194,14 +204,24 @@ export const workflowRoutes: FastifyPluginAsync = async (app) => {
     }
   );
 
-  app.get('/approver/queue', { preHandler: [requireAuthenticated(app), requireRoles(app, ['approver'])] }, async () => {
-    const queue = await app.workflowService.approverQueue();
+  app.get('/approver/queue', { preHandler: [requireAuthenticated(app), requireRoles(app, ['approver'])] }, async (request) => {
+    const actor = request.auth;
+    if (!actor) {
+      throw new HttpError(401, 'UNAUTHORIZED', 'Authentication required.');
+    }
+
+    const queue = await app.workflowService.approverQueue(actor.userId);
     return { queue };
   });
 
   app.get('/approver/applications/:applicationId', { preHandler: [requireAuthenticated(app), requireRoles(app, ['approver'])] }, async (request) => {
+    const actor = request.auth;
+    if (!actor) {
+      throw new HttpError(401, 'UNAUTHORIZED', 'Authentication required.');
+    }
+
     const applicationId = String((request.params as { applicationId: string }).applicationId);
-    return app.workflowService.approverDetail(applicationId);
+    return app.workflowService.approverDetail(applicationId, actor.userId);
   });
 
   app.get(

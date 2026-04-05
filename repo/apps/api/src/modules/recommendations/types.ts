@@ -55,6 +55,15 @@ export interface ResourceRecommendationCandidate {
   updatedAt: Date;
 }
 
+export interface RecentBookingSignalRecord {
+  resourceId: string;
+  resourceName: string;
+  resourceType: 'ROOM' | 'EQUIPMENT' | 'CONSULTATION';
+  location: string | null;
+  bookingCount: number;
+  lastBookedAt: Date;
+}
+
 export interface RecommendationItem {
   targetType: RecommendationTargetType;
   targetId: string;

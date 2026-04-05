@@ -47,7 +47,8 @@ export interface AppConfig {
   logLevel: string;
   publicApiBase: string;
   sessionSecret: string;
-  encryptionKey?: string;
+  encryptionKey: string;
+  bootstrapSecret?: string;
   auth: {
     sessionCookieName: string;
     sessionTtlMinutes: number;
@@ -70,7 +71,8 @@ export interface AppConfig {
 
 export const loadConfig = (): AppConfig => {
   const sessionSecret = readRequiredFromEnvOrFile('APP_SESSION_SECRET');
-  const encryptionKey = readSecretFromEnvOrFile('APP_ENCRYPTION_KEY');
+  const encryptionKey = readRequiredFromEnvOrFile('APP_ENCRYPTION_KEY');
+  const bootstrapSecret = readSecretFromEnvOrFile('APP_BOOTSTRAP_SECRET');
 
   return {
     nodeEnv: process.env.NODE_ENV ?? 'development',
@@ -78,7 +80,8 @@ export const loadConfig = (): AppConfig => {
     logLevel: process.env.LOG_LEVEL ?? 'info',
     publicApiBase: process.env.PUBLIC_API_BASE_URL ?? '/api/v1',
     sessionSecret,
-    ...(encryptionKey ? { encryptionKey } : {}),
+    encryptionKey,
+    ...(bootstrapSecret ? { bootstrapSecret } : {}),
     auth: {
       sessionCookieName: process.env.APP_SESSION_COOKIE_NAME ?? 'rrga_session',
       sessionTtlMinutes: toNumber(process.env.APP_SESSION_TTL_MINUTES, 12 * 60),

@@ -1,6 +1,7 @@
 import { redirect, type Handle } from '@sveltejs/kit';
 import type { AuthUser, UserRole } from '$lib/auth';
 import { fetchApi } from '$lib/server/api';
+import { getSessionCookieName } from '$lib/server/session';
 
 const protectedRolePrefixes = [
   { prefix: '/researcher', requiredRole: 'researcher' },
@@ -19,7 +20,7 @@ const getRequiredRole = (pathname: string): UserRole | null => {
 };
 
 const fetchCurrentUser = async (event: Parameters<Handle>[0]['event']): Promise<AuthUser | null> => {
-  const sessionCookie = event.cookies.get('rrga_session');
+  const sessionCookie = event.cookies.get(getSessionCookieName());
   if (!sessionCookie) {
     return null;
   }

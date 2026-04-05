@@ -32,6 +32,105 @@ const parseDetails = (value: unknown): Record<string, unknown> => {
   return {};
 };
 
+const pendingReviewerIterationExpr = 'COALESCE(ws.iteration_number, 0) + 1';
+const reviewerAccessIterationExpr = `CASE WHEN a.status IN ('SUBMITTED_ON_TIME', 'SUBMITTED_LATE') THEN ${pendingReviewerIterationExpr} ELSE COALESCE(ws.iteration_number, 0) END`;
+
+const backfillReviewerAssignments = async (client: PoolClient, applicationId?: string) => {
+  await client.query(
+    `
+    WITH reviewer_roster AS (
+      SELECT
+        ur.user_id,
+        ROW_NUMBER() OVER (ORDER BY ur.user_id) AS reviewer_slot,
+        COUNT(*) OVER () AS reviewer_count
+      FROM user_roles ur
+      JOIN roles r ON r.id = ur.role_id
+      WHERE r.code = 'reviewer'
+    ),
+    candidate_apps AS (
+      SELECT
+        a.id AS application_id,
+        ${pendingReviewerIterationExpr} AS iteration_number
+      FROM applications a
+      LEFT JOIN application_workflow_state ws ON ws.application_id = a.id
+      WHERE a.status IN ('SUBMITTED_ON_TIME', 'SUBMITTED_LATE')
+        AND ($1::uuid IS NULL OR a.id = $1::uuid)
+    ),
+    target_assignments AS (
+      SELECT
+        candidate_apps.application_id,
+        candidate_apps.iteration_number,
+        reviewer_roster.user_id AS assigned_user_id
+      FROM candidate_apps
+      JOIN reviewer_roster
+        ON reviewer_roster.reviewer_count > 0
+       AND ((get_byte(uuid_send(candidate_apps.application_id), 15) % reviewer_roster.reviewer_count) + 1) = reviewer_roster.reviewer_slot
+    )
+    INSERT INTO application_assignments (
+      application_id,
+      iteration_number,
+      actor_role,
+      approval_level,
+      assigned_user_id
+    )
+    SELECT
+      target_assignments.application_id,
+      target_assignments.iteration_number,
+      'reviewer',
+      0,
+      target_assignments.assigned_user_id
+    FROM target_assignments
+    ON CONFLICT (application_id, iteration_number, actor_role, approval_level) DO NOTHING
+    `,
+    [applicationId ?? null]
+  );
+};
+
+const assignApproversForIteration = async (client: PoolClient, input: {
+  applicationId: string;
+  iterationNumber: number;
+  requiredApprovalLevels: number;
+  assignedByUserId: string;
+}) => {
+  await client.query(
+    `
+    WITH approver_roster AS (
+      SELECT
+        ur.user_id,
+        ROW_NUMBER() OVER (ORDER BY ur.user_id) AS approver_slot,
+        COUNT(*) OVER () AS approver_count
+      FROM user_roles ur
+      JOIN roles r ON r.id = ur.role_id
+      WHERE r.code = 'approver'
+    ),
+    approval_levels AS (
+      SELECT generate_series(1, $3::int) AS approval_level
+    )
+    INSERT INTO application_assignments (
+      application_id,
+      iteration_number,
+      actor_role,
+      approval_level,
+      assigned_user_id,
+      assigned_by_user_id
+    )
+    SELECT
+      $1::uuid,
+      $2::int,
+      'approver',
+      approval_levels.approval_level,
+      approver_roster.user_id,
+      $4::uuid
+    FROM approval_levels
+    JOIN approver_roster
+      ON approver_roster.approver_count > 0
+     AND (((get_byte(uuid_send($1::uuid), 15) + approval_levels.approval_level - 1) % approver_roster.approver_count) + 1) = approver_roster.approver_slot
+    ON CONFLICT (application_id, iteration_number, actor_role, approval_level) DO NOTHING
+    `,
+    [input.applicationId, input.iterationNumber, input.requiredApprovalLevels, input.assignedByUserId]
+  );
+};
+
 const mapWorkflowApplication = (row: Record<string, unknown>): WorkflowApplicationRecord => ({
   id: String(row.id),
   policyId: String(row.policy_id),
@@ -125,7 +224,11 @@ const withTransaction = async <T>(pool: Pool, action: (client: PoolClient) => Pr
 
 export const createWorkflowRepository = (pool: Pool) => {
   return {
-    async listReviewerQueue(): Promise<WorkflowApplicationRecord[]> {
+    async listReviewerQueue(actorUserId: string): Promise<WorkflowApplicationRecord[]> {
+      await withTransaction(pool, async (client) => {
+        await backfillReviewerAssignments(client);
+      });
+
       const result = await pool.query<Record<string, unknown>>(
         `
         SELECT
@@ -139,15 +242,23 @@ export const createWorkflowRepository = (pool: Pool) => {
         FROM applications a
         JOIN funding_policies p ON p.id = a.policy_id
         JOIN users u ON u.id = a.applicant_user_id
+        LEFT JOIN application_workflow_state ws ON ws.application_id = a.id
+        JOIN application_assignments aa
+          ON aa.application_id = a.id
+         AND aa.actor_role = 'reviewer'
+         AND aa.approval_level = 0
+         AND aa.iteration_number = ${pendingReviewerIterationExpr}
+         AND aa.assigned_user_id = $1::uuid
         WHERE a.status IN ('SUBMITTED_ON_TIME', 'SUBMITTED_LATE')
         ORDER BY a.submitted_at ASC NULLS LAST, a.created_at ASC
-        `
+        `,
+        [actorUserId]
       );
 
       return result.rows.map(mapWorkflowApplication);
     },
 
-    async listApproverQueue(): Promise<Array<WorkflowApplicationRecord & { nextApprovalLevel: number; iterationNumber: number }>> {
+    async listApproverQueue(actorUserId: string): Promise<Array<WorkflowApplicationRecord & { nextApprovalLevel: number; iterationNumber: number }>> {
       const result = await pool.query<Record<string, unknown>>(
         `
         SELECT
@@ -164,10 +275,17 @@ export const createWorkflowRepository = (pool: Pool) => {
         JOIN funding_policies p ON p.id = a.policy_id
         JOIN users u ON u.id = a.applicant_user_id
         JOIN application_workflow_state ws ON ws.application_id = a.id
+        JOIN application_assignments aa
+          ON aa.application_id = a.id
+         AND aa.actor_role = 'approver'
+         AND aa.iteration_number = ws.iteration_number
+         AND aa.approval_level = ws.next_approval_level
+         AND aa.assigned_user_id = $1::uuid
         WHERE a.status = 'UNDER_REVIEW'
           AND ws.next_approval_level IS NOT NULL
         ORDER BY a.last_status_at ASC, a.created_at ASC
-        `
+        `,
+        [actorUserId]
       );
 
       return result.rows.map((row) => ({
@@ -194,6 +312,70 @@ export const createWorkflowRepository = (pool: Pool) => {
         WHERE a.id = $1
         `,
         [applicationId]
+      );
+
+      const row = result.rows[0];
+      return row ? mapWorkflowApplication(row) : null;
+    },
+
+    async getReviewerApplicationForActor(applicationId: string, actorUserId: string): Promise<WorkflowApplicationRecord | null> {
+      await withTransaction(pool, async (client) => {
+        await backfillReviewerAssignments(client, applicationId);
+      });
+
+      const result = await pool.query<Record<string, unknown>>(
+        `
+        SELECT
+          a.*,
+          p.title AS policy_title,
+          p.period_start,
+          p.period_end,
+          p.annual_cap_amount,
+          p.approval_levels_required,
+          u.username::text AS applicant_username
+        FROM applications a
+        JOIN funding_policies p ON p.id = a.policy_id
+        JOIN users u ON u.id = a.applicant_user_id
+        LEFT JOIN application_workflow_state ws ON ws.application_id = a.id
+        JOIN application_assignments aa
+          ON aa.application_id = a.id
+         AND aa.actor_role = 'reviewer'
+         AND aa.approval_level = 0
+         AND aa.iteration_number = ${reviewerAccessIterationExpr}
+         AND aa.assigned_user_id = $1::uuid
+        WHERE a.id = $2
+        `,
+        [actorUserId, applicationId]
+      );
+
+      const row = result.rows[0];
+      return row ? mapWorkflowApplication(row) : null;
+    },
+
+    async getApproverApplicationForActor(applicationId: string, actorUserId: string): Promise<WorkflowApplicationRecord | null> {
+      const result = await pool.query<Record<string, unknown>>(
+        `
+        SELECT
+          a.*,
+          p.title AS policy_title,
+          p.period_start,
+          p.period_end,
+          p.annual_cap_amount,
+          p.approval_levels_required,
+          u.username::text AS applicant_username
+        FROM applications a
+        JOIN funding_policies p ON p.id = a.policy_id
+        JOIN users u ON u.id = a.applicant_user_id
+        JOIN application_workflow_state ws ON ws.application_id = a.id
+        JOIN application_assignments aa
+          ON aa.application_id = a.id
+         AND aa.actor_role = 'approver'
+         AND aa.iteration_number = ws.iteration_number
+         AND aa.approval_level = ws.next_approval_level
+         AND aa.assigned_user_id = $1::uuid
+        WHERE a.id = $2
+        `,
+        [actorUserId, applicationId]
       );
 
       const row = result.rows[0];
@@ -327,7 +509,11 @@ export const createWorkflowRepository = (pool: Pool) => {
       return result.rows.map(mapWorkflowDocument);
     },
 
-    async findApplicationDocumentById(documentId: string): Promise<WorkflowDocumentRecord | null> {
+    async findReviewerApplicationDocumentById(applicationId: string, documentId: string, actorUserId: string): Promise<WorkflowDocumentRecord | null> {
+      await withTransaction(pool, async (client) => {
+        await backfillReviewerAssignments(client, applicationId);
+      });
+
       const result = await pool.query<Record<string, unknown>>(
         `
         SELECT
@@ -346,10 +532,57 @@ export const createWorkflowRepository = (pool: Pool) => {
           v.security_scan_findings AS latest_security_findings,
           v.is_admin_review_required AS latest_admin_review_required
         FROM application_documents d
+        JOIN applications a ON a.id = d.application_id
+        LEFT JOIN application_workflow_state ws ON ws.application_id = a.id
+        JOIN application_assignments aa
+          ON aa.application_id = a.id
+         AND aa.actor_role = 'reviewer'
+         AND aa.approval_level = 0
+         AND aa.iteration_number = ${reviewerAccessIterationExpr}
+         AND aa.assigned_user_id = $1::uuid
         LEFT JOIN application_document_versions v ON v.id = d.latest_version_id
-        WHERE d.id = $1
+        WHERE d.application_id = $2
+          AND d.id = $3
         `,
-        [documentId]
+        [actorUserId, applicationId, documentId]
+      );
+
+      const row = result.rows[0];
+      return row ? mapWorkflowDocument(row) : null;
+    },
+
+    async findApproverApplicationDocumentById(applicationId: string, documentId: string, actorUserId: string): Promise<WorkflowDocumentRecord | null> {
+      const result = await pool.query<Record<string, unknown>>(
+        `
+        SELECT
+          d.id,
+          d.application_id,
+          d.document_key,
+          d.label,
+          d.latest_version_id,
+          v.version_number AS latest_version_number,
+          v.storage_type AS latest_storage_type,
+          v.mime_type AS latest_mime_type,
+          v.file_name AS latest_file_name,
+          v.external_url AS latest_external_url,
+          v.is_previewable AS latest_is_previewable,
+          v.security_scan_status AS latest_security_scan_status,
+          v.security_scan_findings AS latest_security_findings,
+          v.is_admin_review_required AS latest_admin_review_required
+        FROM application_documents d
+        JOIN applications a ON a.id = d.application_id
+        JOIN application_workflow_state ws ON ws.application_id = a.id
+        JOIN application_assignments aa
+          ON aa.application_id = a.id
+         AND aa.actor_role = 'approver'
+         AND aa.iteration_number = ws.iteration_number
+         AND aa.approval_level = ws.next_approval_level
+         AND aa.assigned_user_id = $1::uuid
+        LEFT JOIN application_document_versions v ON v.id = d.latest_version_id
+        WHERE d.application_id = $2
+          AND d.id = $3
+        `,
+        [actorUserId, applicationId, documentId]
       );
 
       const row = result.rows[0];
@@ -457,6 +690,15 @@ export const createWorkflowRepository = (pool: Pool) => {
             JSON.stringify({ eligibility: input.eligibility })
           ]
         );
+
+        if (input.decision === 'REVIEW_FORWARD') {
+          await assignApproversForIteration(client, {
+            applicationId: input.applicationId,
+            iterationNumber: input.iterationNumber,
+            requiredApprovalLevels: input.requiredApprovalLevels,
+            assignedByUserId: input.actorUserId
+          });
+        }
 
         await client.query(
           `

@@ -1,6 +1,7 @@
 import type { MultipartFile } from '@fastify/multipart';
 import { HttpError } from '../../lib/http-error.js';
 import { analyzeUploadedFile } from '../../lib/upload-security.js';
+import type { PoolClient } from 'pg';
 import type { AuditWriteInput } from '../audit/types.js';
 import { MAX_DOCUMENT_VERSIONS, DEFAULT_MAX_UPLOAD_BYTES, evaluateDeadlineWindow } from './rules.js';
 import type { createResearcherRepository } from './repository.js';
@@ -57,6 +58,23 @@ export const createResearcherService = (deps: {
     return requiredTemplateKeys.filter((templateKey) => !submittedKeys.has(templateKey));
   };
 
+  const validateRequiredDocumentsInTransaction = async (client: PoolClient, applicationId: string, policyId: string): Promise<string[]> => {
+    const policy = await repository.getPolicyByIdInTransaction(client, policyId);
+    if (!policy) {
+      throw new HttpError(404, 'POLICY_NOT_FOUND', 'Funding policy was not found.');
+    }
+
+    const requiredTemplateKeys = policy.templates.filter((template) => template.isRequired).map((template) => template.templateKey);
+    const documents = await repository.listDocumentsInTransaction(client, applicationId);
+    const submittedKeys = new Set(
+      documents
+        .filter((document) => document.latestVersionId && !document.latestAdminReviewRequired && document.latestSecurityScanStatus !== 'HELD')
+        .map((document) => document.documentKey)
+    );
+
+    return requiredTemplateKeys.filter((templateKey) => !submittedKeys.has(templateKey));
+  };
+
   const computeFiscalYearRange = (periodStartDate: string): { fiscalYearStart: string; fiscalYearEndExclusive: string } => {
     const fiscalYear = new Date(`${periodStartDate}T00:00:00.000Z`).getUTCFullYear();
     return {
@@ -72,140 +90,153 @@ export const createResearcherService = (deps: {
       mode: 'submit' | 'resubmit';
       meta: { requestId?: string; ip?: string; userAgent?: string };
     }) {
-      const application = await ensureOwnApplication(input.applicationId, input.actorUserId);
-
-      if (input.mode === 'resubmit' && application.status !== 'RETURNED_FOR_REVISION') {
-        throw new HttpError(409, 'RESUBMIT_NOT_ALLOWED', 'Resubmission is only allowed for returned applications.');
-      }
-
-      if (!editableStatuses.has(application.status)) {
-        throw new HttpError(409, 'SUBMIT_NOT_ALLOWED', `Cannot submit while application is in status ${application.status}.`);
-      }
-
-      const duplicateCount = await repository.countOtherApplicationsByPolicy({
-        policyId: application.policyId,
-        applicantUserId: application.applicantUserId,
-        excludeApplicationId: application.id
-      });
-
-      const duplicatePass = duplicateCount === 0;
-      await repository.insertValidation({
-        applicationId: application.id,
-        validationType: 'duplicate_policy_period',
-        passed: duplicatePass,
-        details: {
-          duplicateCount
+      const application = await repository.withTransaction(async (client) => {
+        const application = await repository.getApplicationByIdForUpdate(client, input.applicationId);
+        if (!application) {
+          throw new HttpError(404, 'APPLICATION_NOT_FOUND', 'Application was not found.');
         }
-      });
 
-      if (!duplicatePass) {
-        throw new HttpError(409, 'DUPLICATE_APPLICATION', 'Duplicate application in the same policy period is not allowed.');
-      }
+        if (application.applicantUserId !== input.actorUserId) {
+          throw new HttpError(403, 'FORBIDDEN', 'Application does not belong to the current user.');
+        }
 
-      const missingRequiredDocs = await validateRequiredDocuments(application.id, application.policyId);
-      const requiredPass = missingRequiredDocs.length === 0;
-      await repository.insertValidation({
-        applicationId: application.id,
-        validationType: 'required_documents',
-        passed: requiredPass,
-        details: { missingTemplateKeys: missingRequiredDocs }
-      });
+        await repository.lockApplicantForSubmission(client, application.applicantUserId);
 
-      if (!requiredPass) {
-        throw new HttpError(400, 'MISSING_REQUIRED_DOCUMENTS', 'Required documents are missing.', {
-          missingTemplateKeys: missingRequiredDocs
+        if (input.mode === 'resubmit' && application.status !== 'RETURNED_FOR_REVISION') {
+          throw new HttpError(409, 'RESUBMIT_NOT_ALLOWED', 'Resubmission is only allowed for returned applications.');
+        }
+
+        if (!editableStatuses.has(application.status)) {
+          throw new HttpError(409, 'SUBMIT_NOT_ALLOWED', `Cannot submit while application is in status ${application.status}.`);
+        }
+
+        const duplicateCount = await repository.countOtherApplicationsInOverlappingPeriodInTransaction(client, {
+          applicantUserId: application.applicantUserId,
+          periodStart: application.periodStart,
+          periodEnd: application.periodEnd,
+          excludeApplicationId: application.id
         });
-      }
 
-      const fiscalRange = computeFiscalYearRange(application.periodStart);
-      const yearlySum = await repository.sumYearlySubmittedAmounts({
-        applicantUserId: application.applicantUserId,
-        fiscalYearStart: fiscalRange.fiscalYearStart,
-        fiscalYearEndExclusive: fiscalRange.fiscalYearEndExclusive,
-        excludeApplicationId: application.id
-      });
-      const capAmount = Number(application.annualCapAmount);
-      const requestedAmount = Number(application.requestedAmount);
-      const capPass = yearlySum + requestedAmount <= capAmount;
-
-      await repository.insertValidation({
-        applicationId: application.id,
-        validationType: 'annual_cap',
-        passed: capPass,
-        details: {
-          requestedAmount,
-          alreadyCommittedAmount: yearlySum,
-          annualCapAmount: capAmount
-        }
-      });
-
-      if (!capPass) {
-        throw new HttpError(409, 'FUNDING_CAP_EXCEEDED', 'Annual policy funding cap would be exceeded by this submission.', {
-          requestedAmount,
-          alreadyCommittedAmount: yearlySum,
-          annualCapAmount: capAmount
-        });
-      }
-
-      const deadlineEvaluation = evaluateDeadlineWindow({
-        submissionDeadlineAt: application.submissionDeadlineAt,
-        graceHours: application.graceHours,
-        now: new Date(),
-        extensionUntil: application.extensionUntil,
-        extensionUsedAt: application.extensionUsedAt
-      });
-
-      await repository.insertValidation({
-        applicationId: application.id,
-        validationType: 'deadline_window',
-        passed: deadlineEvaluation.mode !== 'blocked',
-        details: {
-          mode: deadlineEvaluation.mode,
-          deadlineAt: deadlineEvaluation.deadlineAt.toISOString(),
-          graceDeadlineAt: deadlineEvaluation.graceDeadlineAt.toISOString(),
-          evaluatedAt: deadlineEvaluation.evaluatedAt.toISOString(),
-          message: deadlineEvaluation.message
-        }
-      });
-
-      if (deadlineEvaluation.mode === 'blocked') {
-        await repository.updateApplicationStatus({
+        const duplicatePass = duplicateCount === 0;
+        await repository.insertValidationInTransaction(client, {
           applicationId: application.id,
-          nextStatus: 'BLOCKED_LATE',
-          changedByUserId: input.actorUserId,
-          reason: 'submission_blocked_after_grace',
-          markSubmittedAt: false
+          validationType: 'duplicate_policy_period',
+          passed: duplicatePass,
+          details: {
+            duplicateCount
+          }
         });
 
-        throw new HttpError(409, 'SUBMISSION_BLOCKED_LATE', 'Submission is blocked because grace period has passed.');
-      }
+        if (!duplicatePass) {
+          throw new HttpError(409, 'DUPLICATE_APPLICATION', 'Duplicate application in the same policy period is not allowed.');
+        }
 
-      if (deadlineEvaluation.mode === 'extension_allowed') {
-        await repository.markExtensionUsed(application.id);
-      }
+        const missingRequiredDocs = await validateRequiredDocumentsInTransaction(client, application.id, application.policyId);
+        const requiredPass = missingRequiredDocs.length === 0;
+        await repository.insertValidationInTransaction(client, {
+          applicationId: application.id,
+          validationType: 'required_documents',
+          passed: requiredPass,
+          details: { missingTemplateKeys: missingRequiredDocs }
+        });
 
-      await repository.updateApplicationStatus({
-        applicationId: application.id,
-        nextStatus: deadlineEvaluation.statusOnSuccess,
-        changedByUserId: input.actorUserId,
-        reason: input.mode === 'submit' ? 'submitted' : 'resubmitted',
-        markSubmittedAt: true
+        if (!requiredPass) {
+          throw new HttpError(400, 'MISSING_REQUIRED_DOCUMENTS', 'Required documents are missing.', {
+            missingTemplateKeys: missingRequiredDocs
+          });
+        }
+
+        const fiscalRange = computeFiscalYearRange(application.periodStart);
+        const yearlySum = await repository.sumYearlySubmittedAmountsInTransaction(client, {
+          applicantUserId: application.applicantUserId,
+          fiscalYearStart: fiscalRange.fiscalYearStart,
+          fiscalYearEndExclusive: fiscalRange.fiscalYearEndExclusive,
+          excludeApplicationId: application.id
+        });
+        const capAmount = Number(application.annualCapAmount);
+        const requestedAmount = Number(application.requestedAmount);
+        const capPass = yearlySum + requestedAmount <= capAmount;
+
+        await repository.insertValidationInTransaction(client, {
+          applicationId: application.id,
+          validationType: 'annual_cap',
+          passed: capPass,
+          details: {
+            requestedAmount,
+            alreadyCommittedAmount: yearlySum,
+            annualCapAmount: capAmount
+          }
+        });
+
+        if (!capPass) {
+          throw new HttpError(409, 'FUNDING_CAP_EXCEEDED', 'Annual policy funding cap would be exceeded by this submission.', {
+            requestedAmount,
+            alreadyCommittedAmount: yearlySum,
+            annualCapAmount: capAmount
+          });
+        }
+
+        const deadlineEvaluation = evaluateDeadlineWindow({
+          submissionDeadlineAt: application.submissionDeadlineAt,
+          graceHours: application.graceHours,
+          now: new Date(),
+          extensionUntil: application.extensionUntil,
+          extensionUsedAt: application.extensionUsedAt
+        });
+
+        await repository.insertValidationInTransaction(client, {
+          applicationId: application.id,
+          validationType: 'deadline_window',
+          passed: deadlineEvaluation.mode !== 'blocked',
+          details: {
+            mode: deadlineEvaluation.mode,
+            deadlineAt: deadlineEvaluation.deadlineAt.toISOString(),
+            graceDeadlineAt: deadlineEvaluation.graceDeadlineAt.toISOString(),
+            evaluatedAt: deadlineEvaluation.evaluatedAt.toISOString(),
+            message: deadlineEvaluation.message
+          }
+        });
+
+        if (deadlineEvaluation.mode === 'blocked') {
+          await repository.updateApplicationStatusInTransaction(client, {
+            applicationId: application.id,
+            nextStatus: 'BLOCKED_LATE',
+            changedByUserId: input.actorUserId,
+            reason: 'submission_blocked_after_grace',
+            markSubmittedAt: false
+          });
+
+          throw new HttpError(409, 'SUBMISSION_BLOCKED_LATE', 'Submission is blocked because grace period has passed.');
+        }
+
+        if (deadlineEvaluation.mode === 'extension_allowed') {
+          await repository.markExtensionUsedInTransaction(client, application.id);
+        }
+
+        await repository.updateApplicationStatusInTransaction(client, {
+          applicationId: application.id,
+          nextStatus: deadlineEvaluation.statusOnSuccess,
+          changedByUserId: input.actorUserId,
+          reason: input.mode === 'submit' ? 'submitted' : 'resubmitted',
+          markSubmittedAt: true
+        });
+
+        return application.id;
       });
 
       await audit.write({
         actorUserId: input.actorUserId,
         eventType: input.mode === 'submit' ? 'APPLICATION_SUBMITTED' : 'APPLICATION_RESUBMITTED',
         entityType: 'application',
-        entityId: application.id,
+        entityId: application,
         outcome: 'success',
         details: {
-          nextStatus: deadlineEvaluation.statusOnSuccess,
-          deadlineMode: deadlineEvaluation.mode
+          mode: input.mode
         },
         ...withMeta(input.meta)
       });
 
-      return repository.getApplicationById(application.id);
+      return repository.getApplicationById(application);
     },
 
     async addFileVersion(input: {
@@ -234,29 +265,32 @@ export const createResearcherService = (deps: {
         throw new HttpError(400, code, security.blockedReason, { findings: security.findings });
       }
 
-      const existingDocuments = await repository.listDocuments(application.id);
-      const existingDocument = existingDocuments.find((entry) => entry.documentKey === input.documentKey);
-      if (existingDocument) {
-        const existingVersions = await repository.countDocumentVersions(existingDocument.id);
-        if (existingVersions >= MAX_DOCUMENT_VERSIONS) {
+      let saved;
+      try {
+        saved = await repository.addFileDocumentVersion({
+          applicationId: application.id,
+          documentKey: input.documentKey,
+          label: input.label,
+          file: input.file,
+          createdByUserId: input.actorUserId,
+          fileBuffer,
+          normalizedMimeType: security.normalizedMimeType,
+          detectedMimeType: security.detectedMimeType,
+          isPreviewable: security.isPreviewable,
+          securityScanStatus: security.status,
+          securityScanFindings: security.findings,
+          isAdminReviewRequired: security.holdForAdminReview
+        });
+      } catch (error) {
+        const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: string }).code ?? '') : '';
+        if (code === 'DOCUMENT_VERSION_LIMIT_REACHED') {
           throw new HttpError(409, 'DOCUMENT_VERSION_LIMIT_REACHED', 'This file has reached the maximum of 20 versions.');
         }
+        if (code === 'INVALID_DOCUMENT_KEY' || code === 'UNSAFE_UPLOAD_PATH') {
+          throw new HttpError(400, 'INVALID_DOCUMENT_KEY', 'documentKey must use only letters, numbers, dots, underscores, and hyphens.');
+        }
+        throw error;
       }
-
-      const saved = await repository.addFileDocumentVersion({
-        applicationId: application.id,
-        documentKey: input.documentKey,
-        label: input.label,
-        file: input.file,
-        createdByUserId: input.actorUserId,
-        fileBuffer,
-        normalizedMimeType: security.normalizedMimeType,
-        detectedMimeType: security.detectedMimeType,
-        isPreviewable: security.isPreviewable,
-        securityScanStatus: security.status,
-        securityScanFindings: security.findings,
-        isAdminReviewRequired: security.holdForAdminReview
-      });
 
       await audit.write({
         actorUserId: input.actorUserId,
@@ -291,27 +325,36 @@ export const createResearcherService = (deps: {
         throw new HttpError(409, 'DOCUMENT_EDIT_NOT_ALLOWED', 'Document versions can only be edited on editable applications.');
       }
 
-      const parsed = new URL(input.externalUrl);
+      let parsed: URL;
+      try {
+        parsed = new URL(input.externalUrl);
+      } catch {
+        throw new HttpError(400, 'INVALID_EXTERNAL_URL', 'Invalid URL format.');
+      }
+
       if (!['https:', 'http:'].includes(parsed.protocol)) {
         throw new HttpError(400, 'UNSAFE_LINK_PROTOCOL', 'Only HTTP and HTTPS links are allowed.');
       }
 
-      const existingDocuments = await repository.listDocuments(application.id);
-      const existingDocument = existingDocuments.find((entry) => entry.documentKey === input.documentKey);
-      if (existingDocument) {
-        const existingVersions = await repository.countDocumentVersions(existingDocument.id);
-        if (existingVersions >= MAX_DOCUMENT_VERSIONS) {
+      let saved;
+      try {
+        saved = await repository.addLinkDocumentVersion({
+          applicationId: application.id,
+          documentKey: input.documentKey,
+          label: input.label,
+          externalUrl: input.externalUrl,
+          createdByUserId: input.actorUserId
+        });
+      } catch (error) {
+        const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: string }).code ?? '') : '';
+        if (code === 'DOCUMENT_VERSION_LIMIT_REACHED') {
           throw new HttpError(409, 'DOCUMENT_VERSION_LIMIT_REACHED', 'This link has reached the maximum of 20 versions.');
         }
+        if (code === 'INVALID_DOCUMENT_KEY' || code === 'UNSAFE_UPLOAD_PATH') {
+          throw new HttpError(400, 'INVALID_DOCUMENT_KEY', 'documentKey must use only letters, numbers, dots, underscores, and hyphens.');
+        }
+        throw error;
       }
-
-      const saved = await repository.addLinkDocumentVersion({
-        applicationId: application.id,
-        documentKey: input.documentKey,
-        label: input.label,
-        externalUrl: input.externalUrl,
-        createdByUserId: input.actorUserId
-      });
 
       await audit.write({
         actorUserId: input.actorUserId,

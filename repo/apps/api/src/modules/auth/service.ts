@@ -20,7 +20,7 @@ export interface AuthContext {
 
 export interface AuthService {
   authenticateFromSessionCookie(sessionToken: string): Promise<AuthContext | null>;
-  bootstrapAdmin(username: string, password: string, meta: AuthRequestMeta): Promise<{ userId: string; username: string; roles: UserRole[] }>;
+  bootstrapAdmin(username: string, password: string, bootstrapSecret: string | undefined, meta: AuthRequestMeta): Promise<{ userId: string; username: string; roles: UserRole[] }>;
   login(input: {
     username: string;
     password: string;
@@ -75,9 +75,13 @@ export const createAuthService = (deps: {
     };
   };
 
-  const bootstrapAdmin: AuthService['bootstrapAdmin'] = async (username, password, meta) => {
+  const bootstrapAdmin: AuthService['bootstrapAdmin'] = async (username, password, bootstrapSecret, meta) => {
     const normalized = normalizeUsername(username);
     const policy = validatePasswordPolicy(password);
+
+    if (!config.bootstrapSecret || bootstrapSecret !== config.bootstrapSecret) {
+      throw unauthorized('Bootstrap secret is invalid.');
+    }
 
     if (!normalized) {
       throw new HttpError(400, 'INVALID_USERNAME', 'Username is required.');
@@ -89,13 +93,11 @@ export const createAuthService = (deps: {
       });
     }
 
-    const existingCount = await repository.countUsers();
-    if (existingCount > 0) {
+    const passwordHash = await hashPassword(password);
+    const user = await repository.createInitialUserWithRole(normalized, passwordHash, 'administrator');
+    if (!user) {
       throw conflict('Bootstrap is only available before the first user is created.');
     }
-
-    const passwordHash = await hashPassword(password);
-    const user = await repository.createUserWithRole(normalized, passwordHash, 'administrator');
 
     await writeAudit({
       actorUserId: user.userId,

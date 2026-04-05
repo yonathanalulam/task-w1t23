@@ -1,4 +1,4 @@
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import type {
   FinanceInvoiceRecord,
   FinanceLedgerEntryRecord,
@@ -132,8 +132,28 @@ const mapLedger = (row: Record<string, unknown>): FinanceLedgerEntryRecord => ({
   createdAt: toDate(row.created_at)
 });
 
+const withTransaction = async <T>(pool: Pool, action: (client: PoolClient) => Promise<T>): Promise<T> => {
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+    const result = await action(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
 export const createFinanceRepository = (pool: Pool) => {
   return {
+    async withTransaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
+      return withTransaction(pool, action);
+    },
+
     async listInvoices(filters: { statuses?: InvoiceStatus[]; hasOpenException?: boolean } = {}): Promise<FinanceInvoiceRecord[]> {
       const clauses: string[] = [];
       const params: unknown[] = [];
@@ -165,6 +185,12 @@ export const createFinanceRepository = (pool: Pool) => {
 
     async getInvoiceById(invoiceId: string): Promise<FinanceInvoiceRecord | null> {
       const result = await pool.query<Record<string, unknown>>('SELECT * FROM finance_invoices WHERE id = $1', [invoiceId]);
+      const row = result.rows[0];
+      return row ? mapInvoice(row) : null;
+    },
+
+    async getInvoiceByIdForUpdate(client: PoolClient, invoiceId: string): Promise<FinanceInvoiceRecord | null> {
+      const result = await client.query<Record<string, unknown>>('SELECT * FROM finance_invoices WHERE id = $1 FOR UPDATE', [invoiceId]);
       const row = result.rows[0];
       return row ? mapInvoice(row) : null;
     },
@@ -239,6 +265,28 @@ export const createFinanceRepository = (pool: Pool) => {
       return mapInvoice(result.rows[0] as Record<string, unknown>);
     },
 
+    async updateInvoiceFinancialsInTransaction(client: PoolClient, input: {
+      invoiceId: string;
+      paidAmount: string;
+      refundedAmount: string;
+      status: InvoiceStatus;
+    }): Promise<FinanceInvoiceRecord> {
+      const result = await client.query<Record<string, unknown>>(
+        `
+        UPDATE finance_invoices
+        SET paid_amount = $2,
+            refunded_amount = $3,
+            status = $4,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING *
+        `,
+        [input.invoiceId, input.paidAmount, input.refundedAmount, input.status]
+      );
+
+      return mapInvoice(result.rows[0] as Record<string, unknown>);
+    },
+
     async setInvoiceExceptionFlag(invoiceId: string, hasOpenException: boolean): Promise<void> {
       await pool.query('UPDATE finance_invoices SET has_open_exception = $2, updated_at = NOW() WHERE id = $1', [invoiceId, hasOpenException]);
     },
@@ -253,6 +301,45 @@ export const createFinanceRepository = (pool: Pool) => {
       note?: string;
     }): Promise<FinancePaymentRecord> {
       const result = await pool.query<Record<string, unknown>>(
+        `
+        INSERT INTO finance_payments (
+          invoice_id,
+          payment_method,
+          wechat_transaction_ref,
+          amount,
+          received_at,
+          settlement_status,
+          recorded_by_user_id,
+          note,
+          created_at,
+          updated_at
+        ) VALUES ($1,$2,$3,$4,$5,'UNSETTLED',$6,$7,NOW(),NOW())
+        RETURNING *
+        `,
+        [
+          input.invoiceId,
+          input.paymentMethod,
+          input.wechatTransactionRef,
+          input.amount,
+          input.receivedAt,
+          input.recordedByUserId,
+          input.note ?? null
+        ]
+      );
+
+      return mapPayment(result.rows[0] as Record<string, unknown>);
+    },
+
+    async createPaymentInTransaction(client: PoolClient, input: {
+      invoiceId: string;
+      paymentMethod: PaymentMethod;
+      wechatTransactionRef: string;
+      amount: string;
+      receivedAt: Date;
+      recordedByUserId: string;
+      note?: string;
+    }): Promise<FinancePaymentRecord> {
+      const result = await client.query<Record<string, unknown>>(
         `
         INSERT INTO finance_payments (
           invoice_id,
@@ -306,6 +393,15 @@ export const createFinanceRepository = (pool: Pool) => {
       return row ? mapPayment(row) : null;
     },
 
+    async getPaymentByIdForInvoice(paymentId: string, invoiceId: string): Promise<FinancePaymentRecord | null> {
+      const result = await pool.query<Record<string, unknown>>(
+        'SELECT * FROM finance_payments WHERE id = $1 AND invoice_id = $2',
+        [paymentId, invoiceId]
+      );
+      const row = result.rows[0];
+      return row ? mapPayment(row) : null;
+    },
+
     async updatePaymentSettlementStatus(input: {
       paymentId: string;
       settlementStatus: SettlementStatus;
@@ -338,6 +434,59 @@ export const createFinanceRepository = (pool: Pool) => {
       refundedAt: Date;
     }): Promise<FinanceRefundRecord> {
       const result = await pool.query<Record<string, unknown>>(
+        `
+        INSERT INTO finance_refunds (
+          invoice_id,
+          payment_id,
+          amount,
+          refund_method,
+          reason,
+          wechat_refund_reference,
+          bank_account_name,
+          bank_routing_number_encrypted,
+          bank_account_number_encrypted,
+          bank_account_last4,
+          recorded_by_user_id,
+          refunded_at,
+          created_at,
+          updated_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),NOW())
+        RETURNING *
+        `,
+        [
+          input.invoiceId,
+          input.paymentId ?? null,
+          input.amount,
+          input.refundMethod,
+          input.reason,
+          input.wechatRefundReference ?? null,
+          input.bankAccountName ?? null,
+          input.bankRoutingNumberEncrypted ?? null,
+          input.bankAccountNumberEncrypted ?? null,
+          input.bankAccountLast4 ?? null,
+          input.recordedByUserId,
+          input.refundedAt
+        ]
+      );
+
+      return mapRefund(result.rows[0] as Record<string, unknown>);
+    },
+
+    async createRefundInTransaction(client: PoolClient, input: {
+      invoiceId: string;
+      paymentId?: string;
+      amount: string;
+      refundMethod: RefundMethod;
+      reason: string;
+      wechatRefundReference?: string;
+      bankAccountName?: string;
+      bankRoutingNumberEncrypted?: string;
+      bankAccountNumberEncrypted?: string;
+      bankAccountLast4?: string;
+      recordedByUserId: string;
+      refundedAt: Date;
+    }): Promise<FinanceRefundRecord> {
+      const result = await client.query<Record<string, unknown>>(
         `
         INSERT INTO finance_refunds (
           invoice_id,
@@ -603,6 +752,53 @@ export const createFinanceRepository = (pool: Pool) => {
       details: Record<string, unknown>;
     }): Promise<FinanceLedgerEntryRecord> {
       const result = await pool.query<Record<string, unknown>>(
+        `
+        INSERT INTO finance_ledger_entries (
+          invoice_id,
+          payment_id,
+          refund_id,
+          settlement_row_id,
+          entry_type,
+          amount,
+          currency_code,
+          actor_user_id,
+          details,
+          created_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,NOW())
+        RETURNING *
+        `,
+        [
+          input.invoiceId ?? null,
+          input.paymentId ?? null,
+          input.refundId ?? null,
+          input.settlementRowId ?? null,
+          input.entryType,
+          input.amount ?? null,
+          input.currencyCode,
+          input.actorUserId,
+          JSON.stringify(input.details)
+        ]
+      );
+
+      const row = result.rows[0] as Record<string, unknown>;
+      return {
+        ...mapLedger(row),
+        actorUsername: null
+      };
+    },
+
+    async createLedgerEntryInTransaction(client: PoolClient, input: {
+      invoiceId?: string;
+      paymentId?: string;
+      refundId?: string;
+      settlementRowId?: number;
+      entryType: LedgerEntryType;
+      amount?: string;
+      currencyCode: string;
+      actorUserId: string;
+      details: Record<string, unknown>;
+    }): Promise<FinanceLedgerEntryRecord> {
+      const result = await client.query<Record<string, unknown>>(
         `
         INSERT INTO finance_ledger_entries (
           invoice_id,

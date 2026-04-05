@@ -81,6 +81,16 @@ const makeRepository = () => {
         updatedAt: new Date()
       }
     ]),
+    listRecentBookingSignals: vi.fn(async () => [
+      {
+        resourceId: '33333333-3333-4333-8333-333333333333',
+        resourceName: 'Observation Room',
+        resourceType: 'ROOM',
+        location: 'North Wing',
+        bookingCount: 2,
+        lastBookedAt: new Date()
+      }
+    ]),
     recommendationTargetExists: vi.fn(async () => true)
   };
 
@@ -161,8 +171,10 @@ describe('recommendations service', () => {
 
     const output = await service.listResearcherRecommendations('researcher-1');
     const journal = output.recommendations.find((entry) => entry.targetType === 'JOURNAL');
+    const resource = output.recommendations.find((entry) => entry.targetType === 'RESOURCE');
 
     expect(journal?.reasons.some((reason) => reason.includes('Contains your keyword'))).toBe(true);
     expect(journal?.reasons.some((reason) => reason.includes('Matches preferred publisher'))).toBe(true);
+    expect(resource?.reasons.some((reason) => reason.includes('You booked this resource 2 time(s) recently.'))).toBe(true);
   });
 });

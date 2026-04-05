@@ -7,6 +7,22 @@ import { createLoggerConfig } from './lib/logger.js';
 import { registerErrorEnvelope } from './plugins/error-envelope.js';
 import { apiModules } from './modules/index.js';
 
+const defaultAllowedOrigins = [
+  'http://127.0.0.1:4173',
+  'http://localhost:4173',
+  'http://127.0.0.1:3000',
+  'http://localhost:3000'
+];
+
+const resolveAllowedOrigins = () => {
+  const configured = (process.env.ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  return configured.length > 0 ? configured : defaultAllowedOrigins;
+};
+
 export interface BuildAppOptions {
   config?: AppConfig;
 }
@@ -28,8 +44,17 @@ export const buildApp = async (options: BuildAppOptions = {}) => {
 
   app.decorate('config', config);
 
+  const allowedOrigins = resolveAllowedOrigins();
+
   await app.register(cors, {
-    origin: true,
+    origin: (origin, callback) => {
+      if (!origin) {
+        callback(null, true);
+        return;
+      }
+
+      callback(null, allowedOrigins.includes(origin));
+    },
     credentials: true
   });
 

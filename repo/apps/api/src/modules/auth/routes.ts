@@ -31,15 +31,18 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
           additionalProperties: false,
           properties: {
             username: { type: 'string', minLength: 1, maxLength: 80 },
-            password: { type: 'string', minLength: 1 }
+            password: { type: 'string', minLength: 1 },
+            bootstrapSecret: { type: 'string', minLength: 1 }
           }
         }
       }
     },
     async (request, reply) => {
-      const body = request.body as { username: string; password: string };
+      const body = request.body as { username: string; password: string; bootstrapSecret?: string };
+      const headerSecret = request.headers['x-bootstrap-secret'];
+      const bootstrapSecret = Array.isArray(headerSecret) ? headerSecret[0] : headerSecret;
 
-      const user = await app.authService.bootstrapAdmin(body.username, body.password, toMeta(request));
+      const user = await app.authService.bootstrapAdmin(body.username, body.password, body.bootstrapSecret ?? bootstrapSecret, toMeta(request));
 
       return reply.code(201).send({
         user

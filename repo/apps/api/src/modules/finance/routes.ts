@@ -25,6 +25,8 @@ const toStatuses = (value: unknown): string[] | undefined => {
   return undefined;
 };
 
+const moneyPattern = '^\\d+(?:\\.\\d{1,2})?$';
+
 export const financeRoutes: FastifyPluginAsync = async (app) => {
   const financeOnly = [requireAuthenticated(app), requireRoles(app, ['finance_clerk'])];
 
@@ -48,7 +50,7 @@ export const financeRoutes: FastifyPluginAsync = async (app) => {
             serviceType: { type: 'string', enum: ['RESOURCE_BOOKING', 'JOURNAL_SERVICE', 'OTHER'] },
             serviceReferenceId: { type: 'string', format: 'uuid' },
             description: { type: 'string', minLength: 2, maxLength: 500 },
-            totalAmount: { type: 'string', minLength: 1, maxLength: 32 },
+            totalAmount: { type: 'string', pattern: moneyPattern, maxLength: 32 },
             dueAt: { type: 'string', minLength: 10, maxLength: 64 }
           }
         }
@@ -99,7 +101,7 @@ export const financeRoutes: FastifyPluginAsync = async (app) => {
           required: ['amount', 'wechatTransactionRef', 'receivedAt'],
           additionalProperties: false,
           properties: {
-            amount: { type: 'string', minLength: 1, maxLength: 32 },
+            amount: { type: 'string', pattern: moneyPattern, maxLength: 32 },
             wechatTransactionRef: { type: 'string', minLength: 3, maxLength: 180 },
             receivedAt: { type: 'string', minLength: 10, maxLength: 64 },
             note: { type: 'string', maxLength: 800 }
@@ -146,7 +148,7 @@ export const financeRoutes: FastifyPluginAsync = async (app) => {
           additionalProperties: false,
           properties: {
             paymentId: { type: 'string', format: 'uuid' },
-            amount: { type: 'string', minLength: 1, maxLength: 32 },
+            amount: { type: 'string', pattern: moneyPattern, maxLength: 32 },
             refundMethod: { type: 'string', enum: ['WECHAT_OFFLINE', 'BANK_TRANSFER'] },
             reason: { type: 'string', minLength: 3, maxLength: 500 },
             refundedAt: { type: 'string', minLength: 10, maxLength: 64 },

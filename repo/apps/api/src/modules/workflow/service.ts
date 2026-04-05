@@ -78,7 +78,7 @@ const evaluateEligibility = (checks: EligibilityCheck[]): EligibilityEvaluation 
 export const createWorkflowService = (deps: { repository: WorkflowRepository; audit: AuditWriter }) => {
   const { repository, audit } = deps;
 
-  const ensureReviewerVisibleApplication = async (applicationId: string) => {
+  const ensureReviewerVisibleApplication = async (applicationId: string, actorUserId: string) => {
     const application = await repository.getApplicationForWorkflow(applicationId);
     if (!application) {
       throw new HttpError(404, 'APPLICATION_NOT_FOUND', 'Application was not found.');
@@ -88,10 +88,15 @@ export const createWorkflowService = (deps: { repository: WorkflowRepository; au
       throw new HttpError(403, 'FORBIDDEN', 'Application is not visible in reviewer workflow surfaces.');
     }
 
-    return application;
+    const assignedApplication = await repository.getReviewerApplicationForActor(applicationId, actorUserId);
+    if (!assignedApplication) {
+      throw new HttpError(403, 'FORBIDDEN', 'Application is not assigned to the current reviewer.');
+    }
+
+    return assignedApplication;
   };
 
-  const ensureApproverVisibleApplication = async (applicationId: string) => {
+  const ensureApproverVisibleApplication = async (applicationId: string, actorUserId: string) => {
     const application = await repository.getApplicationForWorkflow(applicationId);
     if (!application) {
       throw new HttpError(404, 'APPLICATION_NOT_FOUND', 'Application was not found.');
@@ -102,21 +107,31 @@ export const createWorkflowService = (deps: { repository: WorkflowRepository; au
       throw new HttpError(403, 'FORBIDDEN', 'Application is not in an approver-signoff state.');
     }
 
-    return { application, workflowState };
+    const assignedApplication = await repository.getApproverApplicationForActor(applicationId, actorUserId);
+    if (!assignedApplication) {
+      throw new HttpError(403, 'FORBIDDEN', 'Application is not assigned to the current approver.');
+    }
+
+    return { application: assignedApplication, workflowState };
   };
 
   const resolveDocumentAccess = async (input: {
     applicationId: string;
     documentId: string;
+    actorUserId: string;
     role: 'reviewer' | 'approver';
   }) => {
     if (input.role === 'reviewer') {
-      await ensureReviewerVisibleApplication(input.applicationId);
+      await ensureReviewerVisibleApplication(input.applicationId, input.actorUserId);
     } else {
-      await ensureApproverVisibleApplication(input.applicationId);
+      await ensureApproverVisibleApplication(input.applicationId, input.actorUserId);
     }
 
-    const document = await repository.findApplicationDocumentById(input.documentId);
+    const document =
+      input.role === 'reviewer'
+        ? await repository.findReviewerApplicationDocumentById(input.applicationId, input.documentId, input.actorUserId)
+        : await repository.findApproverApplicationDocumentById(input.applicationId, input.documentId, input.actorUserId);
+
     if (!document || document.applicationId !== input.applicationId) {
       throw new HttpError(404, 'DOCUMENT_NOT_FOUND', 'Document was not found.');
     }
@@ -138,16 +153,16 @@ export const createWorkflowService = (deps: { repository: WorkflowRepository; au
   };
 
   return {
-    async reviewerQueue() {
-      return repository.listReviewerQueue();
+    async reviewerQueue(actorUserId: string) {
+      return repository.listReviewerQueue(actorUserId);
     },
 
-    async approverQueue() {
-      return repository.listApproverQueue();
+    async approverQueue(actorUserId: string) {
+      return repository.listApproverQueue(actorUserId);
     },
 
-    async reviewerDetail(applicationId: string) {
-      const application = await ensureReviewerVisibleApplication(applicationId);
+    async reviewerDetail(applicationId: string, actorUserId: string) {
+      const application = await ensureReviewerVisibleApplication(applicationId, actorUserId);
 
       const [workflowState, reviewActions, latestEligibility, documents] = await Promise.all([
         repository.getWorkflowState(applicationId),
@@ -165,8 +180,8 @@ export const createWorkflowService = (deps: { repository: WorkflowRepository; au
       };
     },
 
-    async approverDetail(applicationId: string) {
-      const { application, workflowState } = await ensureApproverVisibleApplication(applicationId);
+    async approverDetail(applicationId: string, actorUserId: string) {
+      const { application, workflowState } = await ensureApproverVisibleApplication(applicationId, actorUserId);
 
       const [reviewActions, latestEligibility, documents] = await Promise.all([
         repository.listReviewActions(applicationId),
@@ -183,12 +198,12 @@ export const createWorkflowService = (deps: { repository: WorkflowRepository; au
       };
     },
 
-    async reviewerDocumentAccess(applicationId: string, documentId: string) {
-      return resolveDocumentAccess({ applicationId, documentId, role: 'reviewer' });
+    async reviewerDocumentAccess(applicationId: string, documentId: string, actorUserId: string) {
+      return resolveDocumentAccess({ applicationId, documentId, actorUserId, role: 'reviewer' });
     },
 
-    async approverDocumentAccess(applicationId: string, documentId: string) {
-      return resolveDocumentAccess({ applicationId, documentId, role: 'approver' });
+    async approverDocumentAccess(applicationId: string, documentId: string, actorUserId: string) {
+      return resolveDocumentAccess({ applicationId, documentId, actorUserId, role: 'approver' });
     },
 
     async reviewerDecision(input: {
@@ -204,10 +219,7 @@ export const createWorkflowService = (deps: { repository: WorkflowRepository; au
         'Reviewer decision requires a comment with at least 3 characters.'
       );
 
-      const application = await repository.getApplicationForWorkflow(input.applicationId);
-      if (!application) {
-        throw new HttpError(404, 'APPLICATION_NOT_FOUND', 'Application was not found.');
-      }
+      const application = await ensureReviewerVisibleApplication(input.applicationId, input.actorUserId);
 
       if (!reviewerEligibleStatuses.has(application.status)) {
         throw new HttpError(409, 'REVIEW_NOT_ALLOWED', `Cannot review application while status is ${application.status}.`);
@@ -315,21 +327,13 @@ export const createWorkflowService = (deps: { repository: WorkflowRepository; au
         'Approval sign-off requires a comment with at least 3 characters.'
       );
 
-      const application = await repository.getApplicationForWorkflow(input.applicationId);
-      if (!application) {
-        throw new HttpError(404, 'APPLICATION_NOT_FOUND', 'Application was not found.');
-      }
+      const { application, workflowState } = await ensureApproverVisibleApplication(input.applicationId, input.actorUserId);
 
-      if (application.status !== 'UNDER_REVIEW') {
-        throw new HttpError(409, 'APPROVAL_NOT_ALLOWED', `Cannot sign off while status is ${application.status}.`);
-      }
-
-      const workflowState = await repository.getWorkflowState(application.id);
-      if (!workflowState?.nextApprovalLevel) {
+      const approvalLevel = workflowState.nextApprovalLevel;
+      if (!approvalLevel) {
         throw new HttpError(409, 'APPROVAL_NOT_ALLOWED', 'No pending approval level is available for sign-off.');
       }
 
-      const approvalLevel = workflowState.nextApprovalLevel;
       const finalApproval = input.decision === 'approve' && approvalLevel >= workflowState.requiredApprovalLevels;
       const nextStatus = input.decision === 'reject' ? 'REJECTED' : finalApproval ? 'APPROVED' : null;
 

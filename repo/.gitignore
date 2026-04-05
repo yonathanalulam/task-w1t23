@@ -13,3 +13,4 @@ tmp/
 # local-only env files are prohibited from this repo
 .env
 .env.*
+.tmp/

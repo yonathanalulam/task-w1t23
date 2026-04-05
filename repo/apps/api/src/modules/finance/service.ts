@@ -70,20 +70,87 @@ const computeInvoiceStatus = (totalCents: number, paidCents: number, refundedCen
 };
 
 const parseCsvRows = (csvText: string): Array<{ lineNumber: number; rawRow: string; columns: string[] }> => {
-  const lines = csvText
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
+  const rows: Array<{ lineNumber: number; rawRow: string; columns: string[] }> = [];
+  let currentField = '';
+  let currentRow: string[] = [];
+  let currentRawRow = '';
+  let rowLineNumber = 1;
+  let lineNumber = 1;
+  let inQuotes = false;
 
-  if (lines.length < 2) {
+  const finalizeRow = () => {
+    currentRow.push(currentField);
+    const hasContent = currentRow.some((field) => field.length > 0);
+    if (hasContent) {
+      rows.push({
+        lineNumber: rowLineNumber,
+        rawRow: currentRawRow,
+        columns: currentRow
+      });
+    }
+
+    currentField = '';
+    currentRow = [];
+    currentRawRow = '';
+    rowLineNumber = lineNumber;
+  };
+
+  for (let index = 0; index < csvText.length; index += 1) {
+    const char = csvText[index] ?? '';
+    const nextChar = csvText[index + 1] ?? '';
+
+    if (char === '"') {
+      currentRawRow += char;
+      if (inQuotes && nextChar === '"') {
+        currentField += '"';
+        currentRawRow += nextChar;
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (!inQuotes && char === ',') {
+      currentField = currentField.trim();
+      currentRow.push(currentField);
+      currentField = '';
+      currentRawRow += char;
+      continue;
+    }
+
+    if (!inQuotes && (char === '\n' || char === '\r')) {
+      if (char === '\r' && nextChar === '\n') {
+        currentRawRow += '\r\n';
+        index += 1;
+      } else {
+        currentRawRow += char;
+      }
+
+      currentField = currentField.trim();
+      lineNumber += 1;
+      finalizeRow();
+      continue;
+    }
+
+    currentField += char;
+    currentRawRow += char;
+  }
+
+  if (inQuotes) {
+    throw new HttpError(400, 'INVALID_SETTLEMENT_CSV', 'Settlement CSV contains an unterminated quoted field.');
+  }
+
+  if (currentField.length > 0 || currentRow.length > 0) {
+    currentField = currentField.trim();
+    finalizeRow();
+  }
+
+  if (rows.length < 2) {
     throw new HttpError(400, 'INVALID_SETTLEMENT_CSV', 'Settlement CSV must include a header row and at least one data row.');
   }
 
-  return lines.slice(1).map((line, index) => ({
-    lineNumber: index + 2,
-    rawRow: line,
-    columns: line.split(',').map((entry) => entry.trim())
-  }));
+  return rows;
 };
 
 const parseSettlementDate = (value: string): Date | null => {
@@ -280,11 +347,6 @@ export const createFinanceService = (deps: {
       note?: string;
       meta: { requestId?: string; ip?: string; userAgent?: string };
     }) {
-      const invoice = await repository.getInvoiceById(input.invoiceId);
-      if (!invoice) {
-        throw new HttpError(404, 'INVOICE_NOT_FOUND', 'Invoice was not found.');
-      }
-
       const amountCents = parseMoneyToCents(input.amount, 'INVALID_PAYMENT_AMOUNT', 'Payment amount must be greater than zero.');
       const ref = input.wechatTransactionRef.trim();
       if (!ref) {
@@ -296,48 +358,60 @@ export const createFinanceService = (deps: {
         throw new HttpError(400, 'INVALID_PAYMENT_RECEIVED_AT', 'Payment received date-time must be valid.');
       }
 
-      const totalCents = toCentsFromRecord(invoice.totalAmount);
-      const nextPaidCents = toCentsFromRecord(invoice.paidAmount) + amountCents;
-      const refundedCents = toCentsFromRecord(invoice.refundedAmount);
-      const nextStatus = computeInvoiceStatus(totalCents, nextPaidCents, refundedCents);
+      const { invoice, payment } = await repository.withTransaction(async (client) => {
+        const invoice = await repository.getInvoiceByIdForUpdate(client, input.invoiceId);
+        if (!invoice) {
+          throw new HttpError(404, 'INVOICE_NOT_FOUND', 'Invoice was not found.');
+        }
 
-      let payment;
-      try {
-        payment = await repository.createPayment({
+        const totalCents = toCentsFromRecord(invoice.totalAmount);
+        const nextPaidCents = toCentsFromRecord(invoice.paidAmount) + amountCents;
+        const refundedCents = toCentsFromRecord(invoice.refundedAmount);
+        const nextStatus = computeInvoiceStatus(totalCents, nextPaidCents, refundedCents);
+
+        let payment;
+        try {
+          payment = await repository.createPaymentInTransaction(client, {
+            invoiceId: invoice.id,
+            paymentMethod: 'WECHAT_OFFLINE',
+            wechatTransactionRef: ref,
+            amount: centsToAmount(amountCents),
+            receivedAt,
+            recordedByUserId: input.actorUserId,
+            ...(input.note?.trim() ? { note: input.note.trim() } : {})
+          });
+        } catch (error) {
+          if (typeof error === 'object' && error && 'code' in error && (error as { code?: string }).code === '23505') {
+            throw new HttpError(409, 'DUPLICATE_WECHAT_TRANSACTION_REFERENCE', 'This WeChat transaction reference was already recorded.');
+          }
+          throw error;
+        }
+
+        const updatedInvoice = await repository.updateInvoiceFinancialsInTransaction(client, {
           invoiceId: invoice.id,
-          paymentMethod: 'WECHAT_OFFLINE',
-          wechatTransactionRef: ref,
-          amount: centsToAmount(amountCents),
-          receivedAt,
-          recordedByUserId: input.actorUserId,
-          ...(input.note?.trim() ? { note: input.note.trim() } : {})
+          paidAmount: centsToAmount(nextPaidCents),
+          refundedAmount: invoice.refundedAmount,
+          status: nextStatus
         });
-      } catch (error) {
-        if (typeof error === 'object' && error && 'code' in error && (error as { code?: string }).code === '23505') {
-          throw new HttpError(409, 'DUPLICATE_WECHAT_TRANSACTION_REFERENCE', 'This WeChat transaction reference was already recorded.');
-        }
-        throw error;
-      }
 
-      const updatedInvoice = await repository.updateInvoiceFinancials({
-        invoiceId: invoice.id,
-        paidAmount: centsToAmount(nextPaidCents),
-        refundedAmount: invoice.refundedAmount,
-        status: nextStatus
-      });
+        await repository.createLedgerEntryInTransaction(client, {
+          invoiceId: invoice.id,
+          paymentId: payment.id,
+          entryType: 'PAYMENT_RECORDED',
+          amount: payment.amount,
+          currencyCode: invoice.currencyCode,
+          actorUserId: input.actorUserId,
+          details: {
+            paymentMethod: payment.paymentMethod,
+            wechatTransactionRef: payment.wechatTransactionRef,
+            settlementStatus: payment.settlementStatus
+          }
+        });
 
-      await repository.createLedgerEntry({
-        invoiceId: invoice.id,
-        paymentId: payment.id,
-        entryType: 'PAYMENT_RECORDED',
-        amount: payment.amount,
-        currencyCode: invoice.currencyCode,
-        actorUserId: input.actorUserId,
-        details: {
-          paymentMethod: payment.paymentMethod,
-          wechatTransactionRef: payment.wechatTransactionRef,
-          settlementStatus: payment.settlementStatus
-        }
+        return {
+          invoice: updatedInvoice,
+          payment
+        };
       });
 
       await audit.write({
@@ -355,7 +429,7 @@ export const createFinanceService = (deps: {
       });
 
       return {
-        invoice: updatedInvoice,
+        invoice,
         payment
       };
     },
@@ -374,22 +448,12 @@ export const createFinanceService = (deps: {
       bankAccountNumber?: string;
       meta: { requestId?: string; ip?: string; userAgent?: string };
     }) {
-      const invoice = await repository.getInvoiceById(input.invoiceId);
-      if (!invoice) {
-        throw new HttpError(404, 'INVOICE_NOT_FOUND', 'Invoice was not found.');
-      }
-
       const reason = input.reason.trim();
       if (!reason) {
         throw new HttpError(400, 'REFUND_REASON_REQUIRED', 'Refund reason is required.');
       }
 
       const amountCents = parseMoneyToCents(input.amount, 'INVALID_REFUND_AMOUNT', 'Refund amount must be greater than zero.');
-      const availableRefundCents = toCentsFromRecord(invoice.paidAmount) - toCentsFromRecord(invoice.refundedAmount);
-      if (amountCents > availableRefundCents) {
-        throw new HttpError(409, 'REFUND_EXCEEDS_AVAILABLE_BALANCE', 'Refund amount exceeds available paid balance.');
-      }
-
       const refundedAt = parseSettlementDate(input.refundedAt);
       if (!refundedAt) {
         throw new HttpError(400, 'INVALID_REFUND_DATE', 'Refund date-time must be valid.');
@@ -425,45 +489,75 @@ export const createFinanceService = (deps: {
         bankAccountLast4 = account.slice(-4);
       }
 
-      const refund = await repository.createRefund({
-        invoiceId: invoice.id,
-        ...(input.paymentId ? { paymentId: input.paymentId } : {}),
-        amount: centsToAmount(amountCents),
-        refundMethod: input.refundMethod,
-        reason,
-        ...(wechatRefundReference ? { wechatRefundReference } : {}),
-        ...(bankAccountName ? { bankAccountName } : {}),
-        ...(bankRoutingNumberEncrypted ? { bankRoutingNumberEncrypted } : {}),
-        ...(bankAccountNumberEncrypted ? { bankAccountNumberEncrypted } : {}),
-        ...(bankAccountLast4 ? { bankAccountLast4 } : {}),
-        recordedByUserId: input.actorUserId,
-        refundedAt
-      });
 
-      const nextRefundedCents = toCentsFromRecord(invoice.refundedAmount) + amountCents;
-      const totalCents = toCentsFromRecord(invoice.totalAmount);
-      const paidCents = toCentsFromRecord(invoice.paidAmount);
-
-      const updatedInvoice = await repository.updateInvoiceFinancials({
-        invoiceId: invoice.id,
-        paidAmount: invoice.paidAmount,
-        refundedAmount: centsToAmount(nextRefundedCents),
-        status: computeInvoiceStatus(totalCents, paidCents, nextRefundedCents)
-      });
-
-      await repository.createLedgerEntry({
-        invoiceId: invoice.id,
-        refundId: refund.id,
-        entryType: 'REFUND_RECORDED',
-        amount: refund.amount,
-        currencyCode: invoice.currencyCode,
-        actorUserId: input.actorUserId,
-        details: {
-          refundMethod: refund.refundMethod,
-          reason: refund.reason,
-          ...(refund.wechatRefundReference ? { wechatRefundReference: refund.wechatRefundReference } : {}),
-          ...(refund.bankAccountLast4 ? { bankAccountLast4: refund.bankAccountLast4 } : {})
+      const { invoice, refund } = await repository.withTransaction(async (client) => {
+        const invoice = await repository.getInvoiceByIdForUpdate(client, input.invoiceId);
+        if (!invoice) {
+          throw new HttpError(404, 'INVOICE_NOT_FOUND', 'Invoice was not found.');
         }
+
+        if (input.paymentId) {
+          const payment = await repository.getPaymentByIdForInvoice(input.paymentId, input.invoiceId);
+          if (!payment) {
+            const anyPayment = await repository.getPaymentById(input.paymentId);
+            if (anyPayment) {
+              throw new HttpError(409, 'PAYMENT_INVOICE_MISMATCH', 'Refund payment reference does not belong to the specified invoice.');
+            }
+
+            throw new HttpError(404, 'PAYMENT_NOT_FOUND', 'Referenced payment was not found.');
+          }
+        }
+
+        const availableRefundCents = toCentsFromRecord(invoice.paidAmount) - toCentsFromRecord(invoice.refundedAmount);
+        if (amountCents > availableRefundCents) {
+          throw new HttpError(409, 'REFUND_EXCEEDS_AVAILABLE_BALANCE', 'Refund amount exceeds available paid balance.');
+        }
+
+        const refund = await repository.createRefundInTransaction(client, {
+          invoiceId: invoice.id,
+          ...(input.paymentId ? { paymentId: input.paymentId } : {}),
+          amount: centsToAmount(amountCents),
+          refundMethod: input.refundMethod,
+          reason,
+          ...(wechatRefundReference ? { wechatRefundReference } : {}),
+          ...(bankAccountName ? { bankAccountName } : {}),
+          ...(bankRoutingNumberEncrypted ? { bankRoutingNumberEncrypted } : {}),
+          ...(bankAccountNumberEncrypted ? { bankAccountNumberEncrypted } : {}),
+          ...(bankAccountLast4 ? { bankAccountLast4 } : {}),
+          recordedByUserId: input.actorUserId,
+          refundedAt
+        });
+
+        const nextRefundedCents = toCentsFromRecord(invoice.refundedAmount) + amountCents;
+        const totalCents = toCentsFromRecord(invoice.totalAmount);
+        const paidCents = toCentsFromRecord(invoice.paidAmount);
+
+        const updatedInvoice = await repository.updateInvoiceFinancialsInTransaction(client, {
+          invoiceId: invoice.id,
+          paidAmount: invoice.paidAmount,
+          refundedAmount: centsToAmount(nextRefundedCents),
+          status: computeInvoiceStatus(totalCents, paidCents, nextRefundedCents)
+        });
+
+        await repository.createLedgerEntryInTransaction(client, {
+          invoiceId: invoice.id,
+          refundId: refund.id,
+          entryType: 'REFUND_RECORDED',
+          amount: refund.amount,
+          currencyCode: invoice.currencyCode,
+          actorUserId: input.actorUserId,
+          details: {
+            refundMethod: refund.refundMethod,
+            reason: refund.reason,
+            ...(refund.wechatRefundReference ? { wechatRefundReference: refund.wechatRefundReference } : {}),
+            ...(refund.bankAccountLast4 ? { bankAccountLast4: refund.bankAccountLast4 } : {})
+          }
+        });
+
+        return {
+          invoice: updatedInvoice,
+          refund
+        };
       });
 
       await audit.write({
@@ -481,7 +575,7 @@ export const createFinanceService = (deps: {
       });
 
       return {
-        invoice: updatedInvoice,
+        invoice,
         refund: sanitizeRefundForClient(refund)
       };
     },
@@ -498,21 +592,13 @@ export const createFinanceService = (deps: {
         throw new HttpError(400, 'SETTLEMENT_CSV_REQUIRED', 'Settlement CSV content is required.');
       }
 
-      const lines = csvText
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean);
-
-      if (lines.length < 2) {
-        throw new HttpError(400, 'INVALID_SETTLEMENT_CSV', 'Settlement CSV must include header and data rows.');
-      }
-
-      const headerLine = lines[0];
-      if (!headerLine) {
+      const parsedRows = parseCsvRows(csvText);
+      const headerRow = parsedRows[0];
+      if (!headerRow) {
         throw new HttpError(400, 'INVALID_SETTLEMENT_CSV', 'Settlement CSV is missing a header row.');
       }
 
-      const header = headerLine.split(',').map((entry) => entry.trim().toLowerCase());
+      const header = headerRow.columns.map((entry) => entry.trim().toLowerCase());
       const refIndex = header.findIndex((col) => ['wechattransactionref', 'wechat_transaction_ref', 'transactionref'].includes(col));
       const amountIndex = header.findIndex((col) => col === 'amount');
       const settledAtIndex = header.findIndex((col) => ['settledat', 'settled_at'].includes(col));
@@ -524,8 +610,6 @@ export const createFinanceService = (deps: {
           'CSV header must include wechatTransactionRef, amount, and settledAt columns.'
         );
       }
-
-      const parsedRows = parseCsvRows(csvText);
       const importRecord = await repository.createSettlementImport({
         sourceLabel,
         importedByUserId: input.actorUserId
@@ -536,7 +620,7 @@ export const createFinanceService = (deps: {
       const seenRefs = new Set<string>();
       const settlementRows = [];
 
-      for (const row of parsedRows) {
+      for (const row of parsedRows.slice(1)) {
         const ref = row.columns[refIndex] ?? '';
         const amountRaw = row.columns[amountIndex] ?? '';
         const settledAtRaw = row.columns[settledAtIndex] ?? '';
@@ -662,10 +746,10 @@ export const createFinanceService = (deps: {
 
       const finalized = await repository.updateSettlementImportCounts({
         importId: importRecord.id,
-        rowCount: parsedRows.length,
-        matchedCount,
-        exceptionCount
-      });
+          rowCount: parsedRows.length - 1,
+          matchedCount,
+          exceptionCount
+        });
 
       await audit.write({
         actorUserId: input.actorUserId,

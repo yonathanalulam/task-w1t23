@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { basename, extname, join } from 'node:path';
+import { basename, extname, join, resolve, sep } from 'node:path';
 import type { MultipartFile } from '@fastify/multipart';
 import type { Pool, PoolClient } from 'pg';
 import type { ApplicationStatus } from './types.js';
@@ -134,6 +134,31 @@ const withTransaction = async <T>(pool: Pool, action: (client: PoolClient) => Pr
   }
 };
 
+const documentKeyRegex = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+
+const assertSafeDocumentKey = (documentKey: string) => {
+  if (!documentKeyRegex.test(documentKey)) {
+    const error = new Error('Invalid document key');
+    (error as Error & { code?: string }).code = 'INVALID_DOCUMENT_KEY';
+    throw error;
+  }
+};
+
+const resolveUploadDirectory = (uploadRoot: string, applicationId: string, documentKey: string): string => {
+  assertSafeDocumentKey(documentKey);
+  const resolvedRoot = resolve(uploadRoot);
+  const resolvedDirectory = resolve(join(resolvedRoot, applicationId, documentKey));
+  const allowedPrefix = `${resolvedRoot}${sep}`;
+
+  if (resolvedDirectory !== resolvedRoot && !resolvedDirectory.startsWith(allowedPrefix)) {
+    const error = new Error('Resolved upload path escaped configured root');
+    (error as Error & { code?: string }).code = 'UNSAFE_UPLOAD_PATH';
+    throw error;
+  }
+
+  return resolvedDirectory;
+};
+
 const mapPolicy = (row: Record<string, unknown>, templates: PolicyTemplateRecord[]): PolicyRecord => {
   return {
     id: String(row.id),
@@ -213,6 +238,75 @@ const mapVersion = (row: Record<string, unknown>): DocumentVersionRecord => {
   };
 };
 
+const getOrCreateDocumentForUpdate = async (client: PoolClient, input: {
+  applicationId: string;
+  documentKey: string;
+  label: string;
+  createdByUserId: string;
+}): Promise<string> => {
+  await client.query('SELECT id FROM applications WHERE id = $1 FOR UPDATE', [input.applicationId]);
+
+  const existing = await client.query<{ id: string }>(
+    'SELECT id FROM application_documents WHERE application_id = $1 AND document_key = $2 FOR UPDATE',
+    [input.applicationId, input.documentKey]
+  );
+
+  if (existing.rows[0]) {
+    return existing.rows[0].id;
+  }
+
+  const created = await client.query<{ id: string }>(
+    `
+    INSERT INTO application_documents (
+      application_id,
+      document_key,
+      label,
+      created_by_user_id
+    ) VALUES ($1,$2,$3,$4)
+    RETURNING id
+    `,
+    [input.applicationId, input.documentKey, input.label, input.createdByUserId]
+  );
+
+  return String(created.rows[0]?.id);
+};
+
+const getNextDocumentVersionNumber = async (client: PoolClient, documentId: string): Promise<number> => {
+  const countResult = await client.query<{ total: string }>(
+    'SELECT COUNT(*)::text AS total FROM application_document_versions WHERE document_id = $1',
+    [documentId]
+  );
+  const currentVersions = Number(countResult.rows[0]?.total ?? '0');
+  if (currentVersions >= 20) {
+    const error = new Error('Document version limit reached');
+    (error as Error & { code?: string }).code = 'DOCUMENT_VERSION_LIMIT_REACHED';
+    throw error;
+  }
+
+  return currentVersions + 1;
+};
+
+const countOverlappingApplications = async (client: PoolClient | Pool, input: {
+  applicantUserId: string;
+  periodStart: string;
+  periodEnd: string;
+  excludeApplicationId?: string;
+}): Promise<number> => {
+  const result = await client.query<{ total: string }>(
+    `
+    SELECT COUNT(*)::text AS total
+    FROM applications a
+    JOIN funding_policies p ON p.id = a.policy_id
+    WHERE a.applicant_user_id = $1
+      AND daterange(p.period_start, p.period_end, '[]') && daterange($2::date, $3::date, '[]')
+      AND ($4::uuid IS NULL OR a.id <> $4::uuid)
+    `,
+    [input.applicantUserId, input.periodStart, input.periodEnd, input.excludeApplicationId ?? null]
+  );
+
+  return Number(result.rows[0]?.total ?? '0');
+};
+
 export const createResearcherRepository = (pool: Pool, uploadRoot: string) => {
   const getPolicyTemplates = async (client: PoolClient | Pool, policyId: string): Promise<PolicyTemplateRecord[]> => {
     const result = await client.query<Record<string, unknown>>(
@@ -264,6 +358,14 @@ export const createResearcherRepository = (pool: Pool, uploadRoot: string) => {
   };
 
   const repository = {
+    async withTransaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
+      return withTransaction(pool, action);
+    },
+
+    async lockApplicantForSubmission(client: PoolClient, applicantUserId: string): Promise<void> {
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [applicantUserId]);
+    },
+
     async listPolicies(includeInactive = false): Promise<PolicyRecord[]> {
       const result = await pool.query<Record<string, unknown>>(
         `
@@ -432,6 +534,17 @@ export const createResearcherRepository = (pool: Pool, uploadRoot: string) => {
       return mapPolicy(row, templates);
     },
 
+    async getPolicyByIdInTransaction(client: PoolClient, policyId: string): Promise<PolicyRecord | null> {
+      const result = await client.query<Record<string, unknown>>('SELECT * FROM funding_policies WHERE id = $1', [policyId]);
+      const row = result.rows[0];
+      if (!row) {
+        return null;
+      }
+
+      const templates = await getPolicyTemplates(client, policyId);
+      return mapPolicy(row, templates);
+    },
+
     async createApplication(input: {
       policyId: string;
       applicantUserId: string;
@@ -439,34 +552,61 @@ export const createResearcherRepository = (pool: Pool, uploadRoot: string) => {
       summary?: string;
       requestedAmount: string;
     }): Promise<ApplicationRecord> {
-      const result = await pool.query<Record<string, unknown>>(
-        `
-        INSERT INTO applications (
-          policy_id,
-          applicant_user_id,
-          title,
-          summary,
-          requested_amount,
-          status
-        ) VALUES ($1,$2,$3,$4,$5,'DRAFT')
-        RETURNING id
-        `,
-        [input.policyId, input.applicantUserId, input.title, input.summary ?? null, input.requestedAmount]
-      );
+      const appId = await withTransaction(pool, async (client) => {
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [input.applicantUserId]);
 
-      const appId = String(result.rows[0]?.id);
-      await pool.query(
-        `
-        INSERT INTO application_status_history (
-          application_id,
-          previous_status,
-          next_status,
-          changed_by_user_id,
-          reason
-        ) VALUES ($1,$2,$3,$4,$5)
-        `,
-        [appId, null, 'DRAFT', input.applicantUserId, 'draft_created']
-      );
+        const policyResult = await client.query<Record<string, unknown>>(
+          'SELECT period_start, period_end FROM funding_policies WHERE id = $1',
+          [input.policyId]
+        );
+        const policy = policyResult.rows[0];
+        if (!policy) {
+          throw new Error('Policy not found for application creation');
+        }
+
+        const duplicateCount = await countOverlappingApplications(client, {
+          applicantUserId: input.applicantUserId,
+          periodStart: toDateOnly(policy.period_start),
+          periodEnd: toDateOnly(policy.period_end)
+        });
+
+        if (duplicateCount > 0) {
+          const error = new Error('Duplicate application in overlapping policy period.');
+          (error as Error & { code?: string }).code = 'APPLICATION_PERIOD_DUPLICATE';
+          throw error;
+        }
+
+        const result = await client.query<Record<string, unknown>>(
+          `
+          INSERT INTO applications (
+            policy_id,
+            applicant_user_id,
+            title,
+            summary,
+            requested_amount,
+            status
+          ) VALUES ($1,$2,$3,$4,$5,'DRAFT')
+          RETURNING id
+          `,
+          [input.policyId, input.applicantUserId, input.title, input.summary ?? null, input.requestedAmount]
+        );
+
+        const appId = String(result.rows[0]?.id);
+        await client.query(
+          `
+          INSERT INTO application_status_history (
+            application_id,
+            previous_status,
+            next_status,
+            changed_by_user_id,
+            reason
+          ) VALUES ($1,$2,$3,$4,$5)
+          `,
+          [appId, null, 'DRAFT', input.applicantUserId, 'draft_created']
+        );
+
+        return appId;
+      });
 
       const application = await repository.getApplicationById(appId);
       if (!application) {
@@ -512,19 +652,41 @@ export const createResearcherRepository = (pool: Pool, uploadRoot: string) => {
       return row ? mapApplication(row) : null;
     },
 
-    async countOtherApplicationsByPolicy(input: { policyId: string; applicantUserId: string; excludeApplicationId: string }): Promise<number> {
-      const result = await pool.query<{ total: string }>(
+    async getApplicationByIdForUpdate(client: PoolClient, applicationId: string): Promise<ApplicationRecord | null> {
+      const result = await client.query<Record<string, unknown>>(
         `
-        SELECT COUNT(*)::text AS total
-        FROM applications
-        WHERE policy_id = $1
-          AND applicant_user_id = $2
-          AND id <> $3
+        SELECT
+          a.*, p.period_start, p.period_end, p.submission_deadline_at, p.grace_hours, p.annual_cap_amount,
+          e.extended_until, e.used_at AS extension_used_at
+        FROM applications a
+        JOIN funding_policies p ON p.id = a.policy_id
+        LEFT JOIN application_extensions e ON e.application_id = a.id
+        WHERE a.id = $1
+        FOR UPDATE OF a
         `,
-        [input.policyId, input.applicantUserId, input.excludeApplicationId]
+        [applicationId]
       );
 
-      return Number(result.rows[0]?.total ?? '0');
+      const row = result.rows[0];
+      return row ? mapApplication(row) : null;
+    },
+
+    async countOtherApplicationsInOverlappingPeriod(input: {
+      applicantUserId: string;
+      periodStart: string;
+      periodEnd: string;
+      excludeApplicationId: string;
+    }): Promise<number> {
+      return countOverlappingApplications(pool, input);
+    },
+
+    async countOtherApplicationsInOverlappingPeriodInTransaction(client: PoolClient, input: {
+      applicantUserId: string;
+      periodStart: string;
+      periodEnd: string;
+      excludeApplicationId: string;
+    }): Promise<number> {
+      return countOverlappingApplications(client, input);
     },
 
     async sumYearlySubmittedAmounts(input: {
@@ -550,8 +712,45 @@ export const createResearcherRepository = (pool: Pool, uploadRoot: string) => {
       return Number(result.rows[0]?.total ?? '0');
     },
 
+    async sumYearlySubmittedAmountsInTransaction(client: PoolClient, input: {
+      applicantUserId: string;
+      fiscalYearStart: string;
+      fiscalYearEndExclusive: string;
+      excludeApplicationId: string;
+    }): Promise<number> {
+      const result = await client.query<{ total: string }>(
+        `
+        SELECT COALESCE(SUM(a.requested_amount), 0)::text AS total
+        FROM applications a
+        JOIN funding_policies p ON p.id = a.policy_id
+        WHERE a.applicant_user_id = $1
+          AND a.id <> $2
+          AND a.status IN ('SUBMITTED_ON_TIME', 'SUBMITTED_LATE', 'APPROVED')
+          AND p.period_start >= $3
+          AND p.period_start < $4
+        `,
+        [input.applicantUserId, input.excludeApplicationId, input.fiscalYearStart, input.fiscalYearEndExclusive]
+      );
+
+      return Number(result.rows[0]?.total ?? '0');
+    },
+
     async insertValidation(input: { applicationId: string; validationType: string; passed: boolean; details: Record<string, unknown> }): Promise<void> {
       await pool.query(
+        `
+        INSERT INTO application_validations (
+          application_id,
+          validation_type,
+          passed,
+          details
+        ) VALUES ($1,$2,$3,$4::jsonb)
+        `,
+        [input.applicationId, input.validationType, input.passed, JSON.stringify(input.details)]
+      );
+    },
+
+    async insertValidationInTransaction(client: PoolClient, input: { applicationId: string; validationType: string; passed: boolean; details: Record<string, unknown> }): Promise<void> {
+      await client.query(
         `
         INSERT INTO application_validations (
           application_id,
@@ -597,6 +796,83 @@ export const createResearcherRepository = (pool: Pool, uploadRoot: string) => {
         ) VALUES ($1,$2,$3,$4,$5)
         `,
         [input.applicationId, previousStatus, input.nextStatus, input.changedByUserId, input.reason]
+      );
+    },
+
+    async updateApplicationStatusInTransaction(client: PoolClient, input: {
+      applicationId: string;
+      nextStatus: ApplicationStatus;
+      changedByUserId: string;
+      reason: string;
+      markSubmittedAt: boolean;
+    }): Promise<void> {
+      const previous = await client.query<{ status: string }>('SELECT status FROM applications WHERE id = $1', [input.applicationId]);
+      const previousStatus = previous.rows[0]?.status ?? null;
+
+      await client.query(
+        `
+        UPDATE applications
+        SET status = $2,
+            submitted_at = CASE WHEN $3 THEN NOW() ELSE submitted_at END,
+            last_status_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $1
+        `,
+        [input.applicationId, input.nextStatus, input.markSubmittedAt]
+      );
+
+      await client.query(
+        `
+        INSERT INTO application_status_history (
+          application_id,
+          previous_status,
+          next_status,
+          changed_by_user_id,
+          reason
+        ) VALUES ($1,$2,$3,$4,$5)
+        `,
+        [input.applicationId, previousStatus, input.nextStatus, input.changedByUserId, input.reason]
+      );
+    },
+
+    async listDocumentsInTransaction(client: PoolClient, applicationId: string): Promise<ApplicationDocumentRecord[]> {
+      const result = await client.query<Record<string, unknown>>(
+        `
+        SELECT
+          d.id,
+          d.application_id,
+          d.document_key,
+          d.label,
+          d.latest_version_id,
+          v.version_number AS latest_version_number,
+          v.storage_type AS latest_storage_type,
+          v.mime_type AS latest_mime_type,
+          v.file_name AS latest_file_name,
+          v.external_url AS latest_external_url,
+          v.is_previewable AS latest_is_previewable,
+          v.security_scan_status AS latest_security_scan_status,
+          v.security_scan_findings AS latest_security_findings,
+          v.is_admin_review_required AS latest_admin_review_required
+        FROM application_documents d
+        LEFT JOIN application_document_versions v ON v.id = d.latest_version_id
+        WHERE d.application_id = $1
+        ORDER BY d.created_at ASC
+        `,
+        [applicationId]
+      );
+
+      return result.rows.map(mapDocument);
+    },
+
+    async markExtensionUsedInTransaction(client: PoolClient, applicationId: string): Promise<void> {
+      await client.query(
+        `
+        UPDATE application_extensions
+        SET used_at = NOW()
+        WHERE application_id = $1
+          AND used_at IS NULL
+        `,
+        [applicationId]
       );
     },
 
@@ -686,37 +962,9 @@ export const createResearcherRepository = (pool: Pool, uploadRoot: string) => {
       createdByUserId: string;
     }): Promise<{ document: ApplicationDocumentRecord; version: DocumentVersionRecord }> {
       return withTransaction(pool, async (client) => {
-        let documentId: string;
-
-        const existing = await client.query<{ id: string }>(
-          'SELECT id FROM application_documents WHERE application_id = $1 AND document_key = $2',
-          [input.applicationId, input.documentKey]
-        );
-
-        if (existing.rows[0]) {
-          documentId = existing.rows[0].id;
-        } else {
-          const created = await client.query<{ id: string }>(
-            `
-            INSERT INTO application_documents (
-              application_id,
-              document_key,
-              label,
-              created_by_user_id
-            ) VALUES ($1,$2,$3,$4)
-            RETURNING id
-            `,
-            [input.applicationId, input.documentKey, input.label, input.createdByUserId]
-          );
-          documentId = String(created.rows[0]?.id);
-        }
-
-        const countResult = await client.query<{ total: string }>(
-          'SELECT COUNT(*)::text AS total FROM application_document_versions WHERE document_id = $1',
-          [documentId]
-        );
-        const currentVersions = Number(countResult.rows[0]?.total ?? '0');
-        const nextVersion = currentVersions + 1;
+        assertSafeDocumentKey(input.documentKey);
+        const documentId = await getOrCreateDocumentForUpdate(client, input);
+        const nextVersion = await getNextDocumentVersionNumber(client, documentId);
 
         const versionResult = await client.query<Record<string, unknown>>(
           `
@@ -769,47 +1017,26 @@ export const createResearcherRepository = (pool: Pool, uploadRoot: string) => {
       securityScanFindings: string[];
       isAdminReviewRequired: boolean;
     }): Promise<{ document: ApplicationDocumentRecord; version: DocumentVersionRecord }> {
-      const originalName = basename(input.file.filename || 'upload.bin');
-      const extension = extname(originalName);
-      const storageName = `${randomUUID()}${extension}`;
-      const policyDir = join(uploadRoot, input.applicationId, input.documentKey);
-      await mkdir(policyDir, { recursive: true });
-
-      const storagePath = join(policyDir, storageName);
-      await writeFile(storagePath, input.fileBuffer);
-
       return withTransaction(pool, async (client) => {
-        let documentId: string;
+        assertSafeDocumentKey(input.documentKey);
+        const originalName = basename(input.file.filename || 'upload.bin');
+        const extension = extname(originalName);
+        const storageName = `${randomUUID()}${extension}`;
+        const policyDir = resolveUploadDirectory(uploadRoot, input.applicationId, input.documentKey);
+        await mkdir(policyDir, { recursive: true });
 
-        const existing = await client.query<{ id: string }>(
-          'SELECT id FROM application_documents WHERE application_id = $1 AND document_key = $2',
-          [input.applicationId, input.documentKey]
-        );
-
-        if (existing.rows[0]) {
-          documentId = existing.rows[0].id;
-        } else {
-          const created = await client.query<{ id: string }>(
-            `
-            INSERT INTO application_documents (
-              application_id,
-              document_key,
-              label,
-              created_by_user_id
-            ) VALUES ($1,$2,$3,$4)
-            RETURNING id
-            `,
-            [input.applicationId, input.documentKey, input.label, input.createdByUserId]
-          );
-          documentId = String(created.rows[0]?.id);
+        const storagePath = resolve(join(policyDir, storageName));
+        const allowedPrefix = `${resolve(uploadRoot)}${sep}`;
+        if (!storagePath.startsWith(allowedPrefix)) {
+          const error = new Error('Resolved upload file path escaped configured root');
+          (error as Error & { code?: string }).code = 'UNSAFE_UPLOAD_PATH';
+          throw error;
         }
 
-        const countResult = await client.query<{ total: string }>(
-          'SELECT COUNT(*)::text AS total FROM application_document_versions WHERE document_id = $1',
-          [documentId]
-        );
-        const currentVersions = Number(countResult.rows[0]?.total ?? '0');
-        const nextVersion = currentVersions + 1;
+        const documentId = await getOrCreateDocumentForUpdate(client, input);
+        const nextVersion = await getNextDocumentVersionNumber(client, documentId);
+
+        await writeFile(storagePath, input.fileBuffer);
 
         const versionResult = await client.query<Record<string, unknown>>(
           `

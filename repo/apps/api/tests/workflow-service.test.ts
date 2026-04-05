@@ -66,13 +66,30 @@ const makeRepository = (input?: { requiredApprovalLevels?: number; missingRequir
         isAdminReviewRequired: false,
         createdAt: new Date('2026-03-01T10:00:00.000Z')
       }
-    ] as any[]
+    ] as any[],
+    reviewerAssignments: new Map<string, string>([['app-1', 'reviewer-1']]),
+    approverAssignments: new Map<string, string>([
+      ['app-1:1', 'approver-1'],
+      ['app-1:2', 'approver-2']
+    ])
+  };
+
+  const isAssignedReviewer = (applicationId: string, actorUserId: string) => state.reviewerAssignments.get(applicationId) === actorUserId;
+  const isAssignedApprover = (applicationId: string, actorUserId: string) => {
+    const level = state.workflowState?.nextApprovalLevel;
+    if (!level) {
+      return false;
+    }
+
+    return state.approverAssignments.get(`${applicationId}:${level}`) === actorUserId;
   };
 
   const repository = {
-    listReviewerQueue: vi.fn(async () => (state.application.status.startsWith('SUBMITTED') ? [{ ...state.application }] : [])),
-    listApproverQueue: vi.fn(async () =>
-      state.application.status === 'UNDER_REVIEW' && state.workflowState?.nextApprovalLevel
+    listReviewerQueue: vi.fn(async (actorUserId: string) =>
+      state.application.status.startsWith('SUBMITTED') && isAssignedReviewer(state.application.id, actorUserId) ? [{ ...state.application }] : []
+    ),
+    listApproverQueue: vi.fn(async (actorUserId: string) =>
+      state.application.status === 'UNDER_REVIEW' && state.workflowState?.nextApprovalLevel && isAssignedApprover(state.application.id, actorUserId)
         ? [
             {
               ...state.application,
@@ -83,6 +100,12 @@ const makeRepository = (input?: { requiredApprovalLevels?: number; missingRequir
         : []
     ),
     getApplicationForWorkflow: vi.fn(async () => ({ ...state.application })),
+    getReviewerApplicationForActor: vi.fn(async (applicationId: string, actorUserId: string) =>
+      applicationId === state.application.id && isAssignedReviewer(applicationId, actorUserId) ? { ...state.application } : null
+    ),
+    getApproverApplicationForActor: vi.fn(async (applicationId: string, actorUserId: string) =>
+      applicationId === state.application.id && isAssignedApprover(applicationId, actorUserId) ? { ...state.application } : null
+    ),
     getWorkflowState: vi.fn(async () => (state.workflowState ? { ...state.workflowState } : null)),
     listReviewActions: vi.fn(async () => state.reviewActions.map((entry) => ({ ...entry }))),
     getLatestEligibilityValidation: vi.fn(async () => {
@@ -100,8 +123,20 @@ const makeRepository = (input?: { requiredApprovalLevels?: number; missingRequir
     listApplicationDocuments: vi.fn(async (applicationId: string) =>
       state.documents.filter((entry) => entry.applicationId === applicationId).map((entry) => ({ ...entry }))
     ),
-    findApplicationDocumentById: vi.fn(async (documentId: string) => {
-      const row = state.documents.find((entry) => entry.id === documentId);
+    findReviewerApplicationDocumentById: vi.fn(async (applicationId: string, documentId: string, actorUserId: string) => {
+      if (!isAssignedReviewer(applicationId, actorUserId)) {
+        return null;
+      }
+
+      const row = state.documents.find((entry) => entry.id === documentId && entry.applicationId === applicationId);
+      return row ? { ...row } : null;
+    }),
+    findApproverApplicationDocumentById: vi.fn(async (applicationId: string, documentId: string, actorUserId: string) => {
+      if (!isAssignedApprover(applicationId, actorUserId)) {
+        return null;
+      }
+
+      const row = state.documents.find((entry) => entry.id === documentId && entry.applicationId === applicationId);
       return row ? { ...row } : null;
     }),
     findApplicationDocumentVersionById: vi.fn(async (versionId: string) => {
@@ -201,6 +236,67 @@ describe('workflow service', () => {
     ).rejects.toHaveProperty('code', 'APPROVAL_COMMENT_REQUIRED');
   });
 
+  it('filters reviewer and approver queues by actor assignment', async () => {
+    const { repository } = makeRepository({ requiredApprovalLevels: 1 });
+    const service = createWorkflowService({ repository: repository as never, audit: { write: vi.fn(async () => undefined) } });
+
+    expect(await service.reviewerQueue('reviewer-1')).toHaveLength(1);
+    expect(await service.reviewerQueue('reviewer-2')).toHaveLength(0);
+
+    await service.reviewerDecision({
+      applicationId: 'app-1',
+      actorUserId: 'reviewer-1',
+      decision: 'forward_to_approval',
+      comment: 'Forward to approval',
+      meta: {}
+    });
+
+    expect(await service.approverQueue('approver-1')).toHaveLength(1);
+    expect(await service.approverQueue('approver-2')).toHaveLength(0);
+  });
+
+  it('blocks unassigned reviewers from detail, document, and decision access', async () => {
+    const { repository } = makeRepository();
+    const service = createWorkflowService({ repository: repository as never, audit: { write: vi.fn(async () => undefined) } });
+
+    await expect(service.reviewerDetail('app-1', 'reviewer-2')).rejects.toHaveProperty('code', 'FORBIDDEN');
+    await expect(service.reviewerDocumentAccess('app-1', 'doc-1', 'reviewer-2')).rejects.toHaveProperty('code', 'FORBIDDEN');
+    await expect(
+      service.reviewerDecision({
+        applicationId: 'app-1',
+        actorUserId: 'reviewer-2',
+        decision: 'forward_to_approval',
+        comment: 'Trying to review someone else assignment',
+        meta: {}
+      })
+    ).rejects.toHaveProperty('code', 'FORBIDDEN');
+  });
+
+  it('blocks unassigned approvers from detail, document, and sign-off access', async () => {
+    const { repository } = makeRepository({ requiredApprovalLevels: 2 });
+    const service = createWorkflowService({ repository: repository as never, audit: { write: vi.fn(async () => undefined) } });
+
+    await service.reviewerDecision({
+      applicationId: 'app-1',
+      actorUserId: 'reviewer-1',
+      decision: 'forward_to_approval',
+      comment: 'Eligible and ready for approval',
+      meta: {}
+    });
+
+    await expect(service.approverDetail('app-1', 'approver-2')).rejects.toHaveProperty('code', 'FORBIDDEN');
+    await expect(service.approverDocumentAccess('app-1', 'doc-1', 'approver-2')).rejects.toHaveProperty('code', 'FORBIDDEN');
+    await expect(
+      service.approverSignOff({
+        applicationId: 'app-1',
+        actorUserId: 'approver-2',
+        decision: 'approve',
+        comment: 'Trying to sign off another approver level',
+        meta: {}
+      })
+    ).rejects.toHaveProperty('code', 'FORBIDDEN');
+  });
+
   it('blocks forwarding when eligibility checks fail and records reasons', async () => {
     const { repository, state } = makeRepository({ missingRequiredDocs: true });
     const service = createWorkflowService({ repository: repository as never, audit: { write: vi.fn(async () => undefined) } });
@@ -278,7 +374,7 @@ describe('workflow service', () => {
 
     await service.reviewerDecision({
       applicationId: 'app-1',
-      actorUserId: 'reviewer-2',
+      actorUserId: 'reviewer-1',
       decision: 'forward_to_approval',
       comment: 'Revisions addressed; forwarding',
       meta: {}
@@ -286,32 +382,6 @@ describe('workflow service', () => {
 
     expect(state.application.status).toBe('UNDER_REVIEW');
     expect(state.workflowState?.iterationNumber).toBe(2);
-  });
-
-  it('returns correct queue visibility across workflow stages', async () => {
-    const { repository } = makeRepository({ requiredApprovalLevels: 1 });
-    const service = createWorkflowService({ repository: repository as never, audit: { write: vi.fn(async () => undefined) } });
-
-    const reviewerQueueBefore = await service.reviewerQueue();
-    const approverQueueBefore = await service.approverQueue();
-
-    expect(reviewerQueueBefore).toHaveLength(1);
-    expect(approverQueueBefore).toHaveLength(0);
-
-    await service.reviewerDecision({
-      applicationId: 'app-1',
-      actorUserId: 'reviewer-1',
-      decision: 'forward_to_approval',
-      comment: 'Forward to approval',
-      meta: {}
-    });
-
-    const reviewerQueueAfter = await service.reviewerQueue();
-    const approverQueueAfter = await service.approverQueue();
-
-    expect(reviewerQueueAfter).toHaveLength(0);
-    expect(approverQueueAfter).toHaveLength(1);
-    expect(approverQueueAfter[0]?.nextApprovalLevel).toBe(1);
   });
 
   it('keeps an append-only action trail across reviewer and approver steps', async () => {
@@ -357,7 +427,7 @@ describe('workflow service', () => {
     const { repository } = makeRepository({ requiredApprovalLevels: 1 });
     const service = createWorkflowService({ repository: repository as never, audit: { write: vi.fn(async () => undefined) } });
 
-    const reviewer = await service.reviewerDetail('app-1');
+    const reviewer = await service.reviewerDetail('app-1', 'reviewer-1');
     expect(reviewer.documents).toHaveLength(1);
     expect(reviewer.documents[0]?.documentKey).toBe('budget');
 
@@ -369,7 +439,7 @@ describe('workflow service', () => {
       meta: {}
     });
 
-    const approver = await service.approverDetail('app-1');
+    const approver = await service.approverDetail('app-1', 'approver-1');
     expect(approver.documents).toHaveLength(1);
     expect(approver.documents[0]?.label).toBe('Budget worksheet');
   });
@@ -381,7 +451,7 @@ describe('workflow service', () => {
 
     const service = createWorkflowService({ repository: repository as never, audit: { write: vi.fn(async () => undefined) } });
 
-    await expect(service.reviewerDocumentAccess('app-1', 'doc-1')).rejects.toHaveProperty('code', 'DOCUMENT_HELD_FOR_ADMIN_REVIEW');
+    await expect(service.reviewerDocumentAccess('app-1', 'doc-1', 'reviewer-1')).rejects.toHaveProperty('code', 'DOCUMENT_HELD_FOR_ADMIN_REVIEW');
 
     await service.reviewerDecision({
       applicationId: 'app-1',
@@ -391,6 +461,6 @@ describe('workflow service', () => {
       meta: {}
     });
 
-    await expect(service.approverDocumentAccess('app-1', 'doc-1')).rejects.toHaveProperty('code', 'DOCUMENT_HELD_FOR_ADMIN_REVIEW');
+    await expect(service.approverDocumentAccess('app-1', 'doc-1', 'approver-1')).rejects.toHaveProperty('code', 'DOCUMENT_HELD_FOR_ADMIN_REVIEW');
   });
 });

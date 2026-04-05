@@ -2,6 +2,7 @@ import type { Pool } from 'pg';
 import type {
   FundingProgramRecommendationCandidate,
   JournalRecommendationCandidate,
+  RecentBookingSignalRecord,
   RecommendationFeedbackAction,
   RecommendationFeedbackRecord,
   RecommendationPreferencesRecord,
@@ -70,6 +71,15 @@ const mapResourceCandidate = (row: Record<string, unknown>): ResourceRecommendat
   timezone: String(row.timezone),
   isActive: Boolean(row.is_active),
   updatedAt: toDate(row.updated_at)
+});
+
+const mapRecentBookingSignal = (row: Record<string, unknown>): RecentBookingSignalRecord => ({
+  resourceId: String(row.resource_id),
+  resourceName: String(row.resource_name),
+  resourceType: String(row.resource_type) as RecentBookingSignalRecord['resourceType'],
+  location: row.location ? String(row.location) : null,
+  bookingCount: Number(row.booking_count),
+  lastBookedAt: toDate(row.last_booked_at)
 });
 
 export const createRecommendationsRepository = (pool: Pool) => {
@@ -221,6 +231,30 @@ export const createRecommendationsRepository = (pool: Pool) => {
       );
 
       return result.rows.map(mapResourceCandidate);
+    },
+
+    async listRecentBookingSignals(userId: string, limit = 5): Promise<RecentBookingSignalRecord[]> {
+      const result = await pool.query<Record<string, unknown>>(
+        `
+        SELECT
+          b.resource_id,
+          r.name AS resource_name,
+          r.resource_type,
+          r.location,
+          COUNT(*)::int AS booking_count,
+          MAX(b.ends_at) AS last_booked_at
+        FROM resource_bookings b
+        JOIN resources r ON r.id = b.resource_id
+        WHERE b.researcher_user_id = $1
+          AND b.status = 'CONFIRMED'
+        GROUP BY b.resource_id, r.name, r.resource_type, r.location
+        ORDER BY MAX(b.ends_at) DESC, COUNT(*) DESC, r.name ASC
+        LIMIT $2
+        `,
+        [userId, limit]
+      );
+
+      return result.rows.map(mapRecentBookingSignal);
     },
 
     async recommendationTargetExists(targetType: RecommendationTargetType, targetId: string): Promise<boolean> {

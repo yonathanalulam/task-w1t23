@@ -3,6 +3,8 @@ import type { DeadlineEvaluation } from './types.js';
 export const MAX_DOCUMENT_VERSIONS = 20;
 export const DEFAULT_MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
 
+const formatGraceHours = (graceHours: number) => `${graceHours}-hour`;
+
 export const isPreviewableMime = (mimeType: string | null): boolean => {
   if (!mimeType) {
     return false;
@@ -61,7 +63,7 @@ export const evaluateDeadlineSurface = (input: {
     return {
       state: 'late_grace',
       submissionAllowed: true,
-      message: 'Submission is currently in the 24-hour late grace window.',
+      message: `Submission is currently in the ${formatGraceHours(input.graceHours)} late grace window.`,
       deadlineAt: input.submissionDeadlineAt,
       graceDeadlineAt,
       extensionUntil,
@@ -108,7 +110,7 @@ export const evaluateDeadlineSurface = (input: {
   return {
     state: 'blocked_no_extension',
     submissionAllowed: false,
-    message: 'Submission is blocked after the grace window and no extension is active.',
+    message: `Submission is blocked after the ${formatGraceHours(input.graceHours)} grace window and no extension is active.`,
     deadlineAt: input.submissionDeadlineAt,
     graceDeadlineAt,
     extensionUntil,
@@ -143,7 +145,7 @@ export const evaluateDeadlineWindow = (input: {
       deadlineAt: input.submissionDeadlineAt,
       graceDeadlineAt,
       evaluatedAt: input.now,
-      message: 'Submission is in the late grace window.'
+      message: `Submission is in the ${formatGraceHours(input.graceHours)} late grace window.`
     };
   }
 
@@ -164,6 +166,6 @@ export const evaluateDeadlineWindow = (input: {
     deadlineAt: input.submissionDeadlineAt,
     graceDeadlineAt,
     evaluatedAt: input.now,
-    message: 'Submission is blocked because the grace period has passed.'
+    message: `Submission is blocked because the ${formatGraceHours(input.graceHours)} grace period has passed.`
   };
 };

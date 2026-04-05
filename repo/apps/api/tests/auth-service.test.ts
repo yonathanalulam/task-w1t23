@@ -33,13 +33,35 @@ const makeRepository = async (): Promise<AuthRepository> => {
     failedLoginAttempts: 0,
     lockoutUntil: null,
     isActive: true,
-    roles: ['administrator']
+    roles: ['administrator'] as UserRole[]
   };
   users.set(baseUser.username, baseUser);
 
   return {
     async countUsers() {
       return users.size;
+    },
+    async createInitialUserWithRole(username, passwordHash, roleCode) {
+      if (users.size > 0) {
+        return null;
+      }
+
+      const next = {
+        userId: `user-${users.size + 1}`,
+        username,
+        passwordHash,
+        failedLoginAttempts: 0,
+        lockoutUntil: null,
+        isActive: true,
+        roles: [roleCode]
+      };
+
+      users.set(username, next);
+      return {
+        userId: next.userId,
+        username: next.username,
+        roles: next.roles
+      };
     },
     async createUserWithRole(username, passwordHash, roleCode) {
       const next = {
