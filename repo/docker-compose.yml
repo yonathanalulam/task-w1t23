@@ -50,7 +50,7 @@ services:
       LOG_LEVEL: info
       APP_SESSION_SECRET_FILE: /run/rrga-runtime/app_session_secret
       APP_ENCRYPTION_KEY_FILE: /run/rrga-runtime/app_encryption_key
-    command: bash -lc "./init_db.sh && npm run dev -w @rrga/api"
+    command: bash -lc "bash ./init_db.sh && npm run dev -w @rrga/api"
     expose:
       - "3000"
     volumes:

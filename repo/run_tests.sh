@@ -19,7 +19,7 @@ echo "[run_tests] COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}"
 docker compose up --build -d db
 
 # Project-standard database bootstrap path.
-docker compose run --rm api bash -lc "./init_db.sh"
+docker compose run --rm api bash -lc "bash ./init_db.sh"
 
 # Broad test wrapper (slice-1 scope): API + web unit/type checks.
 docker compose run --rm api bash -lc "npm run typecheck -w @rrga/api && npm run test -w @rrga/api"
