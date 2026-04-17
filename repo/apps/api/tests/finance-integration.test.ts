@@ -187,7 +187,8 @@ describe('finance routes integration (true no-mock)', () => {
     const csvText = [
       'wechatTransactionRef,amount,settledAt',
       'CSV-REF-1,50.00,2026-06-02T10:00:00.000Z',
-      'UNKNOWN-REF,75.00,2026-06-02T10:00:00.000Z'
+      'UNKNOWN-REF-1,75.00,2026-06-02T10:00:00.000Z',
+      'UNKNOWN-REF-2,10.00,2026-06-02T10:00:00.000Z'
     ].join('\n');
 
     const importResponse = await app!.inject({
@@ -198,10 +199,11 @@ describe('finance routes integration (true no-mock)', () => {
     });
     expect(importResponse.statusCode).toBe(201);
     expect(importResponse.json().import.matchedCount).toBe(1);
-    expect(importResponse.json().import.exceptionCount).toBe(1);
-    const exceptionRow = importResponse.json().rows.find((entry: { status: string }) => entry.status === 'UNMATCHED');
-    expect(exceptionRow).toBeDefined();
-    const rowId = exceptionRow.id as number;
+    expect(importResponse.json().import.exceptionCount).toBe(2);
+    const exceptionRows = importResponse.json().rows.filter((entry: { status: string }) => entry.status === 'UNMATCHED');
+    expect(exceptionRows.length).toBeGreaterThanOrEqual(2);
+    const resolveRowId = exceptionRows[0].id as number;
+    const closeRowId = exceptionRows[1].id as number;
 
     const queueResponse = await app!.inject({
       method: 'GET',
@@ -214,21 +216,21 @@ describe('finance routes integration (true no-mock)', () => {
 
     const resolveResponse = await app!.inject({
       method: 'POST',
-      url: `/api/v1/finance/reconciliation/exceptions/${rowId}/resolve`,
+      url: `/api/v1/finance/reconciliation/exceptions/${resolveRowId}/resolve`,
       headers: { 'content-type': 'application/json', cookie: clerkCookie },
       payload: { resolutionNote: 'Manually matched to invoice INV-CSV' }
     });
     expect(resolveResponse.statusCode).toBe(200);
-    expect(resolveResponse.json().row.id).toBe(rowId);
+    expect(resolveResponse.json().row.id).toBe(resolveRowId);
 
     const closeResponse = await app!.inject({
       method: 'POST',
-      url: `/api/v1/finance/reconciliation/exceptions/${rowId}/close`,
+      url: `/api/v1/finance/reconciliation/exceptions/${closeRowId}/close`,
       headers: { 'content-type': 'application/json', cookie: clerkCookie },
       payload: { resolutionNote: 'Closed after review' }
     });
     expect(closeResponse.statusCode).toBe(200);
-    expect(closeResponse.json().row.id).toBe(rowId);
+    expect(closeResponse.json().row.id).toBe(closeRowId);
   }, integrationTimeout);
 
   it('returns 400 for invalid decimal payment amount on POST /api/v1/finance/invoices/:id/payments', async () => {

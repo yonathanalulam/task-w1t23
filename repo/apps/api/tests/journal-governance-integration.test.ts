@@ -201,7 +201,7 @@ describe('journal governance routes integration (true no-mock)', () => {
       url: `/api/v1/journal-governance/journals/${journalId}/attachments/link`,
       headers: { 'content-type': 'application/json', cookie: adminCookie },
       payload: {
-        attachmentKey: 'contract-2026',
+        attachmentKey: 'contract_2026',
         label: 'Contract 2026',
         category: 'CONTRACT',
         externalUrl: 'https://example.org/contract.pdf',
@@ -210,7 +210,7 @@ describe('journal governance routes integration (true no-mock)', () => {
     });
     expect(linkResponse.statusCode).toBe(201);
     const savedAttachment = linkResponse.json();
-    expect(savedAttachment.attachment.attachmentKey).toBe('contract-2026');
+    expect(savedAttachment.attachment.attachmentKey).toBe('contract_2026');
     const attachmentId = savedAttachment.attachment.id as string;
 
     const versionsResponse = await app!.inject({
