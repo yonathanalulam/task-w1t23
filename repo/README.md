@@ -1,102 +1,207 @@
 # Research Resource & Grant Administration (RRGA)
 
+**Project type: fullstack** (SvelteKit web frontend + Fastify API backend + PostgreSQL).
+
 Slice 8 adds a real finance-clerk vertical slice on top of auth/submission/workflow/journal governance/resource booking/recommendations: offline invoices, offline WeChat reference capture, refunds (full/partial), settlement CSV reconciliation, exception queue, and ledger traceability.
 
-## Current implementation status
+## Quick start (Docker-first — required path)
 
-Implemented in this stage:
+Everything below runs inside Docker — no local runtime dependencies (Node, Postgres, argon2) need to be installed on the host.
 
-- Monorepo foundations (`apps/api`, `apps/web`, `packages/shared`)
-- Fastify + TypeScript API with offline auth/RBAC/audit baseline plus researcher/workflow, journal governance, resource booking, recommendations, and finance slices:
-  - `GET /api/v1/health`
-  - `POST /api/v1/auth/bootstrap-admin` (first-user bootstrap only)
-  - `POST /api/v1/auth/login`
-  - `POST /api/v1/auth/logout`
-  - `GET /api/v1/auth/me`
-  - `POST /api/v1/auth/change-password`
-  - `GET /api/v1/admin/ping` (administrator-only RBAC check route)
-  - `GET/POST/PATCH/DELETE /api/v1/policies`
-  - `POST /api/v1/researcher/applications`
-  - `GET /api/v1/researcher/applications`
-  - `GET /api/v1/researcher/applications/:id`
-  - `POST /api/v1/researcher/applications/:id/submit`
-  - `POST /api/v1/researcher/applications/:id/resubmit`
-  - `POST /api/v1/researcher/applications/:id/documents/file`
-  - `POST /api/v1/researcher/applications/:id/documents/link`
-  - `GET /api/v1/researcher/applications/:id/documents/:documentId/versions`
-  - `POST /api/v1/researcher/applications/:id/documents/:documentId/rollback/:versionId`
-  - `GET /api/v1/researcher/applications/:id/documents/:documentId/preview`
-  - `GET /api/v1/researcher/applications/:id/documents/:documentId/download`
-  - `POST /api/v1/researcher/applications/:id/extensions` (administrator-only one-time extension)
-  - `GET /api/v1/workflow/reviewer/queue`
-  - `GET /api/v1/workflow/reviewer/applications/:id`
-  - `POST /api/v1/workflow/reviewer/applications/:id/decision`
-  - `GET /api/v1/workflow/approver/queue`
-  - `GET /api/v1/workflow/approver/applications/:id`
-  - `POST /api/v1/workflow/approver/applications/:id/sign-off`
-  - `GET/POST /api/v1/journal-governance/custom-fields`
-  - `PATCH /api/v1/journal-governance/custom-fields/:fieldId`
-  - `GET/POST /api/v1/journal-governance/journals`
-  - `GET/PATCH/DELETE /api/v1/journal-governance/journals/:journalId`
-  - `GET /api/v1/journal-governance/journals/:journalId/history`
-  - `POST /api/v1/journal-governance/journals/:journalId/attachments/file`
-  - `POST /api/v1/journal-governance/journals/:journalId/attachments/link`
-  - `GET /api/v1/journal-governance/journals/:journalId/attachments/:attachmentId/versions`
-  - `GET /api/v1/journal-governance/journals/:journalId/attachments/:attachmentId/download`
-  - `GET /api/v1/resource-booking/manager/resources`
-  - `POST /api/v1/resource-booking/manager/resources`
-  - `GET /api/v1/resource-booking/manager/resources/:resourceId`
-  - `PATCH /api/v1/resource-booking/manager/resources/:resourceId`
-  - `PUT /api/v1/resource-booking/manager/resources/:resourceId/business-hours`
-  - `POST /api/v1/resource-booking/manager/resources/:resourceId/blackouts`
-  - `GET /api/v1/resource-booking/researcher/availability`
-  - `GET /api/v1/resource-booking/researcher/bookings`
-  - `POST /api/v1/resource-booking/researcher/bookings`
-  - `GET /api/v1/recommendations/researcher`
-  - `GET /api/v1/recommendations/researcher/preferences`
-  - `PUT /api/v1/recommendations/researcher/preferences`
-  - `GET /api/v1/recommendations/researcher/feedback`
-  - `POST /api/v1/recommendations/researcher/feedback`
-  - `GET /api/v1/finance/invoices`
-  - `POST /api/v1/finance/invoices`
-  - `GET /api/v1/finance/invoices/:invoiceId`
-  - `POST /api/v1/finance/invoices/:invoiceId/payments`
-   - `POST /api/v1/finance/invoices/:invoiceId/refunds`
-   - `POST /api/v1/finance/reconciliation/import-csv`
-   - `GET /api/v1/finance/reconciliation/queue`
-   - `POST /api/v1/finance/reconciliation/exceptions/:rowId/resolve`
-   - `POST /api/v1/finance/reconciliation/exceptions/:rowId/close`
-    - `GET /api/v1/finance/ledger`
-   - `GET /api/v1/admin/upload-holds`
-   - `POST /api/v1/admin/upload-holds/researcher-documents/:versionId/release`
-   - `POST /api/v1/admin/upload-holds/journal-attachments/:versionId/release`
-   - `GET /api/v1/workflow/reviewer/applications/:id/documents/:documentId/preview`
-   - `GET /api/v1/workflow/reviewer/applications/:id/documents/:documentId/download`
-   - `GET /api/v1/workflow/approver/applications/:id/documents/:documentId/preview`
-   - `GET /api/v1/workflow/approver/applications/:id/documents/:documentId/download`
-  - shared JSON error envelope
-  - structured logging with sensitive-field redaction
-- SvelteKit + TypeScript web auth + multi-role role-workspace surfaces:
-  - `/login`
-  - `/forbidden`
-  - role-protected routes `/researcher`, `/researcher/applications/[id]`, `/researcher/resources`, `/researcher/recommendations`, `/reviewer`, `/reviewer/applications/[id]`, `/approver`, `/approver/applications/[id]`, `/manager`, `/manager/resources/[resourceId]`, `/finance`, `/finance/invoices/[invoiceId]`, `/admin`, `/admin/journals`, `/admin/journals/[journalId]`
-- PostgreSQL tables/migrations for auth, researcher/workflow, and journal governance (custom field definitions, journal versions, attachment versions)
-- Docker-first runtime wrapper (`./run_app.sh up`, which runs `docker compose up --build`)
-- Broad Dockerized test wrapper (`./run_tests.sh`)
+### 1. Start the stack
 
-Hardening delivered in this stage:
+```bash
+docker-compose up --build
+```
 
-- upload security depth for researcher/journal file flows:
-  - server-side MIME sniffing
-  - executable filename/content blocking
-  - archive expansion safety checks
-  - sensitive-pattern detection with warning/hold metadata
-- explicit finance exception lifecycle:
-  - open exception queue + resolved/closed history
-  - finance-clerk resolve/close actions
-  - ledger/audit trace for exception resolution actions
+This is the canonical startup command. The repo also ships an equivalent wrapper (`./run_app.sh up`) that adds stable follow-up commands and fixed-port fallback behavior — either is supported.
 
-## Role surfaces at a glance
+On first boot, Compose provisions runtime DB/app secret files inside a Docker-managed volume automatically, so a fresh clone does not require any exported `RRGA_DB_*`, `APP_SESSION_SECRET`, or `APP_ENCRYPTION_KEY` values.
+
+### 2. Access the running app
+
+The web UI binds to localhost only (`127.0.0.1`). Default published port is random (to avoid host collisions); resolve it with the helper:
+
+```bash
+./run_app.sh url
+# prints e.g. http://127.0.0.1:54321
+```
+
+Pin a fixed port (with automatic fallback to random if unavailable):
+
+```bash
+APP_PORT=4173 ./run_app.sh up
+# open http://127.0.0.1:4173
+```
+
+The API is reachable from inside containers at `http://api:3000`, and is exposed to the host through the web service reverse-proxy at `http://127.0.0.1:<WEB_PORT>/api/v1/...`.
+
+### 3. Seed demo credentials
+
+With the stack running, seed deterministic demo accounts for every role:
+
+```bash
+docker compose exec api node scripts/seed_demo_users.mjs
+```
+
+This script is idempotent (re-running refreshes password hashes and re-grants roles).
+
+### 4. Verify startup
+
+- API health (from host; shell-neutral):
+
+```bash
+curl -sf "http://127.0.0.1:<WEB_PORT>/api/v1/health"
+# expect JSON: {"status":"ok",...}
+```
+
+- UI: open `http://127.0.0.1:<WEB_PORT>/login` in a browser and sign in with any demo credential from the table below.
+
+- Broad automated verification (Docker-contained; no local install):
+
+```bash
+./run_tests.sh
+```
+
+## Demo credentials (all roles)
+
+Demo credentials are produced deterministically by `scripts/seed_demo_users.mjs` (step 3 above). Usernames, passwords, and roles:
+
+| Role              | Username     | Password            |
+|-------------------|--------------|---------------------|
+| administrator     | `admin`      | `AdminPass1!`       |
+| researcher        | `researcher` | `ResearcherPass1!`  |
+| reviewer          | `reviewer`   | `ReviewerPass1!`    |
+| approver          | `approver`   | `ApproverPass1!`    |
+| resource_manager  | `manager`    | `ManagerPass1!`     |
+| finance_clerk     | `clerk`      | `ClerkPass1!`       |
+
+Password policy: minimum 10 chars, upper/lower/number/symbol. The seeded passwords above all satisfy this policy.
+
+If you want to create the administrator account without the helper script, the first-user bootstrap endpoint is available:
+
+```bash
+curl -i -X POST "http://127.0.0.1:<WEB_PORT>/session/bootstrap-admin" \
+  -H 'content-type: application/json' \
+  -d '{"username":"admin","password":"AdminPass1!"}'
+```
+
+After bootstrap, sign in at `/login`.
+
+## Operational follow-up commands
+
+```bash
+./run_app.sh ps
+./run_app.sh logs
+./run_app.sh logs-follow
+./run_app.sh url
+./run_app.sh down
+```
+
+Underlying Docker command used by the wrapper:
+
+```bash
+docker-compose up --build
+```
+
+Collision-safe defaults:
+
+- no `container_name` usage
+- unique Compose project naming path via `name: ${COMPOSE_PROJECT_NAME:-rrga_${USER:-local}}`
+- only web app port exposed to host
+- host binding is localhost only (`127.0.0.1`)
+- random host port by default
+
+## Implemented surfaces
+
+### API endpoints (resolved at `/api/v1/...`)
+
+- `GET /api/v1/health`
+- `GET /api/v1/auth/password-policy`
+- `POST /api/v1/auth/bootstrap-admin` (first-user bootstrap only)
+- `POST /api/v1/auth/login`
+- `POST /api/v1/auth/logout`
+- `GET /api/v1/auth/me`
+- `POST /api/v1/auth/change-password`
+- `GET /api/v1/admin/ping` (administrator-only RBAC check route)
+- `GET /api/v1/admin/upload-holds`
+- `POST /api/v1/admin/upload-holds/researcher-documents/:versionId/release`
+- `POST /api/v1/admin/upload-holds/journal-attachments/:versionId/release`
+- `GET /api/v1/policies`
+- `GET /api/v1/policies/:policyId`
+- `POST /api/v1/policies`
+- `PATCH /api/v1/policies/:policyId`
+- `DELETE /api/v1/policies/:policyId`
+- `POST /api/v1/researcher/applications`
+- `GET /api/v1/researcher/applications`
+- `GET /api/v1/researcher/applications/:applicationId`
+- `POST /api/v1/researcher/applications/:applicationId/submit`
+- `POST /api/v1/researcher/applications/:applicationId/resubmit`
+- `POST /api/v1/researcher/applications/:applicationId/documents/file`
+- `POST /api/v1/researcher/applications/:applicationId/documents/link`
+- `GET /api/v1/researcher/applications/:applicationId/documents/:documentId/versions`
+- `POST /api/v1/researcher/applications/:applicationId/documents/:documentId/rollback/:versionId`
+- `GET /api/v1/researcher/applications/:applicationId/documents/:documentId/preview`
+- `GET /api/v1/researcher/applications/:applicationId/documents/:documentId/download`
+- `POST /api/v1/researcher/applications/:applicationId/extensions` (administrator-only one-time extension)
+- `GET /api/v1/researcher/applications/:applicationId/status-history`
+- `GET /api/v1/researcher/applications/:applicationId/validations`
+- `GET /api/v1/workflow/reviewer/queue`
+- `GET /api/v1/workflow/reviewer/applications/:applicationId`
+- `GET /api/v1/workflow/reviewer/applications/:applicationId/documents/:documentId/preview`
+- `GET /api/v1/workflow/reviewer/applications/:applicationId/documents/:documentId/download`
+- `POST /api/v1/workflow/reviewer/applications/:applicationId/decision`
+- `GET /api/v1/workflow/approver/queue`
+- `GET /api/v1/workflow/approver/applications/:applicationId`
+- `GET /api/v1/workflow/approver/applications/:applicationId/documents/:documentId/preview`
+- `GET /api/v1/workflow/approver/applications/:applicationId/documents/:documentId/download`
+- `POST /api/v1/workflow/approver/applications/:applicationId/sign-off`
+- `GET /api/v1/journal-governance/custom-fields`
+- `POST /api/v1/journal-governance/custom-fields`
+- `PATCH /api/v1/journal-governance/custom-fields/:fieldId`
+- `GET /api/v1/journal-governance/journals`
+- `POST /api/v1/journal-governance/journals`
+- `GET /api/v1/journal-governance/journals/:journalId`
+- `PATCH /api/v1/journal-governance/journals/:journalId`
+- `DELETE /api/v1/journal-governance/journals/:journalId`
+- `GET /api/v1/journal-governance/journals/:journalId/history`
+- `POST /api/v1/journal-governance/journals/:journalId/attachments/file`
+- `POST /api/v1/journal-governance/journals/:journalId/attachments/link`
+- `GET /api/v1/journal-governance/journals/:journalId/attachments/:attachmentId/versions`
+- `GET /api/v1/journal-governance/journals/:journalId/attachments/:attachmentId/download`
+- `GET /api/v1/resource-booking/manager/resources`
+- `POST /api/v1/resource-booking/manager/resources`
+- `GET /api/v1/resource-booking/manager/resources/:resourceId`
+- `PATCH /api/v1/resource-booking/manager/resources/:resourceId`
+- `PUT /api/v1/resource-booking/manager/resources/:resourceId/business-hours`
+- `POST /api/v1/resource-booking/manager/resources/:resourceId/blackouts`
+- `GET /api/v1/resource-booking/researcher/availability`
+- `GET /api/v1/resource-booking/researcher/bookings`
+- `POST /api/v1/resource-booking/researcher/bookings`
+- `GET /api/v1/recommendations/researcher`
+- `GET /api/v1/recommendations/researcher/preferences`
+- `PUT /api/v1/recommendations/researcher/preferences`
+- `GET /api/v1/recommendations/researcher/feedback`
+- `POST /api/v1/recommendations/researcher/feedback`
+- `GET /api/v1/finance/invoices`
+- `POST /api/v1/finance/invoices`
+- `GET /api/v1/finance/invoices/:invoiceId`
+- `POST /api/v1/finance/invoices/:invoiceId/payments`
+- `POST /api/v1/finance/invoices/:invoiceId/refunds`
+- `POST /api/v1/finance/reconciliation/import-csv`
+- `GET /api/v1/finance/reconciliation/queue`
+- `POST /api/v1/finance/reconciliation/exceptions/:rowId/resolve`
+- `POST /api/v1/finance/reconciliation/exceptions/:rowId/close`
+- `GET /api/v1/finance/ledger`
+
+Shared behaviors: JSON error envelope, structured logging with sensitive-field redaction, Docker-first runtime wrapper, and broad Dockerized test wrapper (`./run_tests.sh`).
+
+### Web routes
+
+- `/login`, `/forbidden`
+- Role-protected: `/researcher`, `/researcher/applications/[id]`, `/researcher/resources`, `/researcher/recommendations`, `/reviewer`, `/reviewer/applications/[id]`, `/approver`, `/approver/applications/[id]`, `/manager`, `/manager/resources/[resourceId]`, `/finance`, `/finance/invoices/[invoiceId]`, `/admin`, `/admin/journals`, `/admin/journals/[journalId]`
+
+### Role surfaces at a glance
 
 - Researcher: `/researcher`, `/researcher/applications/[id]`, `/researcher/resources`, `/researcher/recommendations`
 - Reviewer: `/reviewer`, `/reviewer/applications/[id]`
@@ -119,70 +224,9 @@ Hardening delivered in this stage:
 - `apps/api` — Fastify backend service
 - `apps/web` — SvelteKit frontend service
 - `packages/shared` — shared cross-app types
-- the repository remains understandable from this README, source tree, scripts, and in-code route/module structure.
-- `init_db.sh` — **only** project-standard DB initialization path
+- `init_db.sh` — **only** project-standard DB initialization path (Docker-contained)
 - `run_tests.sh` — broad Dockerized test wrapper
-
-## Runtime (primary)
-
-Primary runtime contract for this repo is:
-
-```bash
-./run_app.sh up
-```
-
-This wrapper is Docker-first underneath and is the supported operational path because it keeps runtime credentials/secrets and project naming consistent across later invocations (`ps`, `logs`, `down`, `url`) without `.env` files.
-
-Cold-start raw Compose is also supported now:
-
-```bash
-docker compose up --build
-```
-
-On first boot, Compose provisions runtime DB/app secret files inside a Docker-managed volume automatically, so a clean clone does not require exported `RRGA_DB_*`, `APP_SESSION_SECRET`, or `APP_ENCRYPTION_KEY` values.
-
-`./run_app.sh up` remains the preferred user-facing command because it also handles stable follow-up commands and fixed-port fallback behavior.
-
-Underlying Docker command used by wrapper:
-
-```bash
-docker compose up --build
-```
-
-Collision-safe defaults:
-
-- no `container_name` usage
-- unique Compose project naming path via `name: ${COMPOSE_PROJECT_NAME:-rrga_${USER:-local}}`
-- only web app port exposed to host
-- host binding is localhost only (`127.0.0.1`)
-- random host port by default
-
-Fixed-port override with fallback:
-
-```bash
-APP_PORT=4173 ./run_app.sh up
-```
-
-- If requested port is available, wrapper uses it.
-- If requested port is unavailable, wrapper falls back to a random localhost port and prints the resolved UI URL.
-
-Operational follow-up commands (consistent across shells):
-
-```bash
-./run_app.sh ps
-./run_app.sh logs
-./run_app.sh logs-follow
-./run_app.sh url
-./run_app.sh down
-```
-
-## Runtime database/config inputs
-
-- Database credentials/bootstrap values are provided at runtime only (env or `*_FILE` secret paths), never hardcoded.
-- Plain Compose startup stores generated runtime values in a Docker-managed named volume.
-- `./run_app.sh` can still persist runtime values under `.runtime/` for stable follow-up operations and explicit local overrides.
-- `./run_tests.sh` uses isolated ephemeral runtime values per test run.
-- API config also supports env-or-file loading for DB/app secrets.
+- `scripts/seed_demo_users.mjs` — deterministic demo-user seeder (run inside the api container)
 
 ## Database initialization contract
 
@@ -198,67 +242,17 @@ Use `./init_db.sh` for all DB setup/migration application. Runtime and broad tes
 ./run_tests.sh
 ```
 
-This is Dockerized and invokes `./init_db.sh` before tests.
+This is Dockerized and invokes `./init_db.sh` before tests. No local tooling install is required.
 
-## Local non-Docker iteration commands
+## Secret/config handling (no `.env` files)
 
-```bash
-npm install
-source ./scripts/runtime_env.sh && setup_runtime_env_persistent "$(pwd)"
-export PGHOST=127.0.0.1 PGPORT=5432 PGUSER="$RRGA_DB_USER" PGPASSWORD="$RRGA_DB_PASSWORD" PGDATABASE="$RRGA_DB_NAME"
-npm run dev:api
-npm run dev:web
-npm run test:api
-npm run test:web
-npm run typecheck
+- `.env` files are not used or committed in this repo.
+- Runtime secrets/config are read from process environment variables or `*_FILE` paths (Docker secret-compatible).
+- `./run_app.sh` keeps persistent runtime values in `.runtime/` to preserve operational consistency across invocations.
+- Plain Compose startup stores generated runtime values in a Docker-managed named volume.
+- `./run_tests.sh` uses isolated ephemeral runtime values per test run.
 
-# optional targeted runtime proof for extension-aware submit gating
-WEB_URL="http://$(source ./scripts/runtime_env.sh && setup_runtime_env_persistent \"$(pwd)\" && docker compose port web 4173 | tr -d '\r')"
-VERIFY_BASE_URL="$WEB_URL" node scripts/verify_extension_ui.mjs
-
-# optional targeted runtime proof for review + approval path
-VERIFY_BASE_URL="$WEB_URL" node scripts/verify_review_approval_ui.mjs
-
-# optional targeted runtime proof for journal governance admin flow
-VERIFY_BASE_URL="$WEB_URL" node scripts/verify_journal_governance_ui.mjs
-
-# optional targeted runtime proof for resource booking manager/researcher flow
-VERIFY_BASE_URL="$WEB_URL" node scripts/verify_resource_booking_ui.mjs
-
-# optional targeted runtime proof for recommendations preference+feedback flow
-VERIFY_BASE_URL="$WEB_URL" node scripts/verify_recommendations_ui.mjs
-
-# optional targeted runtime proof for finance invoice/reconciliation/refund flow
-VERIFY_BASE_URL="$WEB_URL" node scripts/verify_finance_ui.mjs
-
-# targeted runtime proof for hardening surfaces (upload scan visibility + finance exception resolve/close UI)
-VERIFY_BASE_URL="$WEB_URL" node scripts/verify_hardening_ui.mjs
-
-# integrated Playwright UI flow coverage (submission, review/approval, booking, recommendations, finance)
-./scripts/run_integrated_e2e.sh
-
-# equivalent npm wrapper
-npm run test:web:e2e:integrated
-```
-
-Integrated E2E artifacts are written under:
-
-- `apps/web/test-results/` (checkpoint screenshots + trace/error context)
-- `apps/web/playwright-report/` (Playwright HTML report when generated)
-
-## Auth bootstrap for first local login
-
-When the database has no users yet, create the first administrator account:
-
-```bash
-curl -i -X POST http://127.0.0.1:<WEB_PORT>/session/bootstrap-admin \
-  -H 'content-type: application/json' \
-  -d '{"username":"admin","password":"AdminPass1!"}'
-```
-
-After bootstrap, sign in at `/login`.
-
-Password policy: minimum 10 chars, upper/lower/number/symbol.
+---
 
 ## Submission and workflow slice notes
 
@@ -321,8 +315,11 @@ Password policy: minimum 10 chars, upper/lower/number/symbol.
 - Queue includes open exceptions plus recently resolved/closed exception history
 - Ledger trail (`finance_ledger_entries`) records who did what and when for invoice/payment/refund/reconciliation events
 
-## Secret/config handling (no `.env` files)
+## Integrated end-to-end coverage
 
-- `.env` files are not used or committed in this repo.
-- Runtime secrets/config are read from process environment variables or `*_FILE` paths (Docker secret-compatible).
-- `./run_app.sh` keeps persistent runtime values in `.runtime/` to preserve operational consistency across invocations.
+Playwright-driven fullstack flows (submission, review/approval, booking, recommendations, finance) run entirely inside the Docker test harness via `./run_tests.sh`. No host-side tooling or dependency install is required.
+
+Artifacts produced by the Docker test run are written under:
+
+- `apps/web/test-results/` (checkpoint screenshots + trace/error context)
+- `apps/web/playwright-report/` (Playwright HTML report when generated)
